@@ -88,6 +88,10 @@ services:
     image: XENTOOLS_TAG
     cgroupsPath: /eve/services/xen-tools
     oomScoreAdj: -999
+  - name: eve-k3s 
+    image: K3S_TAG
+    cgroupsPath: /eve/services/eve-k3s
+    oomScoreAdj: -999
 files:
   - path: /etc/eve-release
     contents: 'EVE_VERSION'

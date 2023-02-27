@@ -182,3 +182,5 @@ zip
 zlib
 zlib-dev
 zlib-static
+openrc
+open-iscsi
