@@ -1,6 +1,6 @@
 module github.com/lf-edge/eve/pkg/pillar
 
-go 1.18
+go 1.20
 
 require (
 	github.com/Focinfi/go-dns-resolver v1.0.1
@@ -22,14 +22,12 @@ require (
 	github.com/google/gopacket v1.1.19
 	github.com/gorilla/websocket v1.4.2
 	github.com/grandcat/zeroconf v1.0.0
+	github.com/insomniacslk/dhcp v0.0.0-20221215072855-de60144f33f8
 	github.com/jackwakefield/gopac v1.0.2
 	github.com/jaypipes/ghw v0.8.0
 	github.com/lf-edge/edge-containers v0.0.0-20221025050409-93c34bebadd2
 	github.com/lf-edge/eve/api/go v0.0.0-00010101000000-000000000000
-	github.com/lf-edge/eve/libs/depgraph v0.0.0-20220129022022-ba04fd269658
-	github.com/lf-edge/eve/libs/nettrace v0.0.0-20230219061744-883547fe7978
-	github.com/lf-edge/eve/libs/reconciler v0.0.0-20220131150115-6941dbe72001
-	github.com/lf-edge/eve/libs/zedUpload v0.0.0-20210120050122-276fea8f6efd
+	github.com/lf-edge/eve/libs v0.0.0-20230303013136-e890ce9ee8a3
 	github.com/linuxkit/linuxkit/src/cmd/linuxkit v0.0.0-20220913135124-e532e7310810
 	github.com/moby/sys/mountinfo v0.6.0
 	github.com/onsi/gomega v1.24.2
@@ -49,7 +47,7 @@ require (
 	golang.org/x/net v0.7.0
 	golang.org/x/sys v0.5.0
 	google.golang.org/grpc v1.47.0
-	google.golang.org/protobuf v1.28.0
+	google.golang.org/protobuf v1.28.1
 )
 
 require (
@@ -94,13 +92,15 @@ require (
 	github.com/gorilla/mux v1.8.0 // indirect
 	github.com/jaypipes/pcidb v0.6.0 // indirect
 	github.com/jmespath/go-jmespath v0.4.0 // indirect
-	github.com/josharian/native v1.0.0 // indirect
+	github.com/josharian/native v1.0.1-0.20221213033349-c1e37c09b531 // indirect
 	github.com/klauspost/compress v1.15.1 // indirect
 	github.com/kr/fs v0.1.0 // indirect
 	github.com/lithammer/shortuuid/v4 v4.0.0 // indirect
 	github.com/mattn/go-ieproxy v0.0.1 // indirect
 	github.com/matttproud/golang_protobuf_extensions v1.0.4 // indirect
+	github.com/mdlayher/ethernet v0.0.0-20190606142754-0394541c37b7 // indirect
 	github.com/mdlayher/netlink v1.7.1 // indirect
+	github.com/mdlayher/raw v0.0.0-20191009151244-50f2db8cc065 // indirect
 	github.com/mdlayher/socket v0.4.0 // indirect
 	github.com/miekg/dns v1.1.41 // indirect
 	github.com/mitchellh/go-homedir v1.1.0 // indirect
@@ -122,6 +122,7 @@ require (
 	github.com/ti-mo/netfilter v0.3.1 // indirect
 	github.com/tklauser/go-sysconf v0.3.11 // indirect
 	github.com/tklauser/numcpus v0.6.0 // indirect
+	github.com/u-root/uio v0.0.0-20221213070652-c3537552635f // indirect
 	github.com/vbatts/tar-split v0.11.2 // indirect
 	github.com/vishvananda/netns v0.0.0-20210104183010-2eb08e3e575f // indirect
 	github.com/xeipuuv/gojsonpointer v0.0.0-20180127040702-4e3ac2762d5f // indirect
@@ -144,9 +145,3 @@ require (
 )
 
 replace github.com/lf-edge/eve/api/go => ../../api/go
-
-replace github.com/lf-edge/eve/libs/zedUpload => ../../libs/zedUpload
-
-replace github.com/lf-edge/eve/libs/depgraph => ../../libs/depgraph
-
-replace github.com/lf-edge/eve/libs/reconciler => ../../libs/reconciler

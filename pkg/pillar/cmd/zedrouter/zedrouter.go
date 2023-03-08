@@ -10,6 +10,7 @@
 package zedrouter
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"errors"
@@ -33,6 +34,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/pidfile"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	"github.com/lf-edge/eve/pkg/pillar/types"
+	"github.com/lf-edge/eve/pkg/pillar/uplinkprober"
 	"github.com/lf-edge/eve/pkg/pillar/utils"
 	"github.com/lf-edge/eve/pkg/pillar/zedcloud"
 	uuid "github.com/satori/go.uuid"
@@ -97,9 +99,7 @@ type zedrouterContext struct {
 	networkInstanceStatusMap  sync.Map
 	NLaclMap                  map[uuid.UUID]map[string]types.ULNetworkACLs // app uuid plus bridge ul name
 	dnsServers                map[string][]net.IP                          // Key is ifname
-	checkNIUplinks            chan bool
-	hostProbeTimer            *time.Timer
-	hostFastProbe             bool
+	uplinkProber              *uplinkprober.UplinkProber
 	appNetCreateTimer         *time.Timer
 	appCollectStatsRunning    bool
 	appStatsMutex             sync.Mutex // to protect the changing appNetworkStatus & appCollectStatsRunning
@@ -583,8 +583,15 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	flowStatTimer := flextimer.NewRangeTicker(time.Duration(fmin),
 		time.Duration(fmax))
 
-	setProbeTimer(&zedrouterCtx, nhProbeInterval)
-	zedrouterCtx.checkNIUplinks = make(chan bool, 1) // allow one signal without blocking
+	reachProber := uplinkprober.NewControllerReachProber(
+		log, agentName, zedrouterCtx.zedcloudMetrics)
+	uplinkProber := uplinkprober.NewUplinkProber(
+		log, uplinkprober.DefaultConfig(), reachProber)
+	zedrouterCtx.uplinkProber = uplinkProber
+	probeUpdates := uplinkProber.WatchProbeUpdates()
+	if zedrouterCtx.deviceNetworkStatus != nil {
+		uplinkProber.ApplyDNSUpdate(*zedrouterCtx.deviceNetworkStatus)
+	}
 
 	zedrouterCtx.appNetCreateTimer = time.NewTimer(1 * time.Second)
 	zedrouterCtx.appNetCreateTimer.Stop()
@@ -597,43 +604,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 	zedrouterCtx.ready = true
 	log.Functionf("zedrouterCtx.ready\n")
-
-	// First wait for restarted from zedmanager to
-	// reduce the number of LISP-RESTARTs
-	for !subAppNetworkConfig.Restarted() {
-		log.Functionf("Waiting for zedrouter to report restarted")
-		select {
-		case change := <-subGlobalConfig.MsgChan():
-			subGlobalConfig.ProcessChange(change)
-
-		case change := <-subAssignableAdapters.MsgChan():
-			subAssignableAdapters.ProcessChange(change)
-
-		case change := <-subAppNetworkConfig.MsgChan():
-			// If we have NetworkInstanceConfig process it first
-			checkAndProcessNetworkInstanceConfig(&zedrouterCtx)
-			subAppNetworkConfig.ProcessChange(change)
-
-		case change := <-subDeviceNetworkStatus.MsgChan():
-			subDeviceNetworkStatus.ProcessChange(change)
-
-		case change := <-subNetworkInstanceConfig.MsgChan():
-			log.Functionf("AppNetworkConfig - waiting to Restart - "+
-				"InstanceConfig change at %+v", time.Now())
-			subNetworkInstanceConfig.ProcessChange(change)
-		}
-		// Are we likely to have seen all of the initial config?
-		if zedrouterCtx.triggerNumGC &&
-			time.Since(zedrouterCtx.receivedConfigTime) > 5*time.Minute {
-
-			start := time.Now()
-			gcNumAllocators(&zedrouterCtx)
-			zedrouterCtx.triggerNumGC = false
-			ps.CheckMaxTimeTopic(agentName, "allocatorGC", start,
-				warningTime, errorTime)
-		}
-	}
-	log.Functionf("Zedrouter has restarted. Entering main Select loop")
 
 	for {
 		select {
@@ -749,14 +719,40 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			ps.CheckMaxTimeTopic(agentName, "FlowStatsCollect", start,
 				warningTime, errorTime)
 
-		case <-zedrouterCtx.hostProbeTimer.C:
+		case updates := <-probeUpdates:
 			start := time.Now()
-			log.Tracef("HostProbeTimer at %v", time.Now())
-			// launch the go function gateway/remote hosts probing check
-			log.Functionf("Creating %s at %s", "launchHostProbe",
-				agentlog.GetMyStack())
-			go launchHostProbe(&zedrouterCtx)
-			ps.CheckMaxTimeTopic(agentName, "lauchHostProbe", start,
+			log.Tracef("ProbeUpdates at %v", time.Now())
+			for _, probeUpdate := range updates {
+				niKey := probeUpdate.NetworkInstance.String()
+				item, err := zedrouterCtx.pubNetworkInstanceStatus.Get(niKey)
+				if err != nil {
+					log.Errorf("Failed to get status for network instance %s", niKey)
+					continue
+				}
+				status := item.(types.NetworkInstanceStatus)
+				ports := zedrouterCtx.deviceNetworkStatus.GetPortsByLogicallabel(
+					probeUpdate.SelectedUplinkLL)
+				if len(ports) != 1 {
+					log.Errorf("Label of selected uplink does not match single interface (%v)",
+						ports)
+					continue
+				}
+				status.SelectedUplinkIntf = ports[0].IfName
+				publishNetworkInstanceStatus(&zedrouterCtx, &status)
+				if status.ProgUplinkIntf == status.SelectedUplinkIntf {
+					log.Noticef("Uplink (%s) has not actually changed"+
+						" for network instance %s",
+						status.SelectedUplinkIntf, status.DisplayName)
+					continue
+				}
+				err = doNetworkInstanceFallback(&zedrouterCtx, &status)
+				if err != nil {
+					log.Errorf("Failed to perform network instance (%s) fallback: %v",
+						status.DisplayName, err)
+					continue
+				}
+			}
+			ps.CheckMaxTimeTopic(agentName, "probeUpdates", start,
 				warningTime, errorTime)
 
 		case <-zedrouterCtx.appNetCreateTimer.C:
@@ -764,13 +760,6 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			log.Tracef("appNetCreateTimer: at %v", time.Now())
 			scanAppNetworkStatusInErrorAndUpdate(&zedrouterCtx)
 			ps.CheckMaxTimeTopic(agentName, "scanAppNetworkStatus", start,
-				warningTime, errorTime)
-
-		case <-zedrouterCtx.checkNIUplinks:
-			start := time.Now()
-			log.Functionf("checkNIUplinks channel signal\n")
-			checkAndReprogramNetworkInstances(&zedrouterCtx)
-			ps.CheckMaxTimeTopic(agentName, "checkAndReprogram", start,
 				warningTime, errorTime)
 
 		case change := <-subNetworkInstanceConfig.MsgChan():
@@ -1125,6 +1114,51 @@ func appNetworkDoActivateAllUnderlayNetworks(
 	return nil
 }
 
+func compareIPVersion(a, b net.IP) bool {
+	return (a.To4() == nil) == (b.To4() == nil)
+}
+
+func checkIPRange(start, middle, end net.IP) {
+	if start == nil {
+		log.Warnf("no range check without start address")
+		return
+	}
+
+	if middle == nil && end == nil {
+		return
+	}
+	if middle == nil && end != nil {
+		if !compareIPVersion(start, end) {
+			log.Warnf("IPv6 and IPv4 mixed: %s, %s", start.String(), end.String())
+			return
+		}
+
+		if bytes.Compare(start, end) > 0 {
+			log.Warnf("start %s > end %s", start.String(), end.String())
+			return
+		}
+	}
+	if middle != nil && end != nil {
+		if !compareIPVersion(start, middle) || !compareIPVersion(middle, end) {
+			log.Warnf("IPv6 and IPv4 mixed: %s, %s, %s", start.String(), middle.String(), end.String())
+			return
+		}
+
+		if bytes.Compare(start, middle) > 0 {
+			log.Warnf("start %s > middle %s", start.String(), middle.String())
+			return
+		}
+		if bytes.Compare(start, end) > 0 {
+			log.Warnf("start %s > end %s", start.String(), end.String())
+			return
+		}
+		if bytes.Compare(middle, end) > 0 {
+			log.Warnf("middle %s > end %s", middle.String(), end.String())
+			return
+		}
+	}
+}
+
 func appNetworkDoActivateUnderlayNetwork(
 	ctx *zedrouterContext,
 	config types.AppNetworkConfig,
@@ -1253,6 +1287,7 @@ func appNetworkDoActivateUnderlayNetwork(
 	setNetworkACLRules(ctx, appID, ulStatus.Name, ruleList)
 
 	if appIPAddr != "" {
+		checkIPRange(netInstStatus.DhcpRange.Start, net.ParseIP(appIPAddr), netInstStatus.DhcpRange.End)
 		// XXX clobber any IPv6 EID entry since same name
 		// but that's probably OK since we're doing IPv4 EIDs
 		addhostDnsmasq(bridgeName, appMac, appIPAddr,
@@ -1266,12 +1301,12 @@ func appNetworkDoActivateUnderlayNetwork(
 	if restartDnsmasq && ulStatus.BridgeIPAddr != "" {
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netInstStatus.CurrentUplinkIntf)
+			netInstStatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netInstStatus.CurrentUplinkIntf)
+			netInstStatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netInstStatus, hostsDirpath,
-			newIpsets, netInstStatus.CurrentUplinkIntf,
+			newIpsets, netInstStatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -1743,12 +1778,12 @@ func doAppNetworkModifyUNetAcls(
 		hostsDirpath := runDirname + "/hosts." + bridgeName
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netstatus, hostsDirpath,
-			newIpsets, netstatus.CurrentUplinkIntf,
+			newIpsets, netstatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -1988,12 +2023,12 @@ func appNetworkDoInactivateUnderlayNetwork(
 	if restartDnsmasq && ulStatus.BridgeIPAddr != "" {
 		stopDnsmasq(bridgeName, true, false)
 		dnsServers := types.GetDNSServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		ntpServers := types.GetNTPServers(*ctx.deviceNetworkStatus,
-			netstatus.CurrentUplinkIntf)
+			netstatus.SelectedUplinkIntf)
 		createDnsmasqConfiglet(ctx, bridgeName,
 			ulStatus.BridgeIPAddr, netstatus, hostsDirpath,
-			newIpsets, netstatus.CurrentUplinkIntf,
+			newIpsets, netstatus.SelectedUplinkIntf,
 			dnsServers, ntpServers)
 		startDnsmasq(bridgeName)
 	}
@@ -2165,10 +2200,12 @@ func handleDNSImpl(ctxArg interface{}, key string,
 		status)
 	*ctx.deviceNetworkStatus = status
 	maybeHandleDNS(ctx)
-
-	deviceUpdateNIprobing(ctx, &status)
 	if changedDepend != nil {
 		updateACLIPAddr(ctx, changedDepend)
+	}
+
+	if ctx.uplinkProber != nil {
+		ctx.uplinkProber.ApplyDNSUpdate(status)
 	}
 
 	// Look for ports which disappeared

@@ -284,7 +284,8 @@ func (acMetric AppContainerMetrics) LogKey() string {
 }
 
 // IntfStatusMap - Used to return per-interface test results (success and failures)
-//  ifName is used as the key
+//
+//	ifName is used as the key
 type IntfStatusMap struct {
 	// StatusMap -> Key: ifname, Value: TestResults
 	StatusMap map[string]TestResults
@@ -942,9 +943,9 @@ const (
 )
 
 type ProxyEntry struct {
-	Type   NetworkProxyType
-	Server string
-	Port   uint32
+	Type   NetworkProxyType `json:"type"`
+	Server string           `json:"server"`
+	Port   uint32           `json:"port"`
 }
 
 type ProxyConfig struct {
@@ -1414,20 +1415,44 @@ func EqualSubnet(subnet1, subnet2 net.IPNet) bool {
 // GetPortByIfName - Get Port Status for port with given Ifname
 func (status *DeviceNetworkStatus) GetPortByIfName(
 	ifname string) *NetworkPortStatus {
-	for _, portStatus := range status.Ports {
-		if portStatus.IfName == ifname {
-			return &portStatus
+	for i := range status.Ports {
+		if status.Ports[i].IfName == ifname {
+			return &status.Ports[i]
 		}
 	}
 	return nil
 }
 
-// GetPortByLogicallabel - Get Port Status for port with given label
-func (status *DeviceNetworkStatus) GetPortByLogicallabel(
-	label string) *NetworkPortStatus {
-	for _, portStatus := range status.Ports {
-		if portStatus.Logicallabel == label {
-			return &portStatus
+// GetPortsByLogicallabel - Get Port Status for all ports matching the given label.
+func (status *DeviceNetworkStatus) GetPortsByLogicallabel(
+	label string) (ports []*NetworkPortStatus) {
+	// Check for shared labels first.
+	switch label {
+	case UplinkLabel:
+		for i := range status.Ports {
+			if status.Version >= DPCIsMgmt && !status.Ports[i].IsMgmt {
+				continue
+			}
+			ports = append(ports, &status.Ports[i])
+		}
+		return ports
+	case FreeUplinkLabel:
+		for i := range status.Ports {
+			if status.Version >= DPCIsMgmt && !status.Ports[i].IsMgmt {
+				continue
+			}
+			if status.Ports[i].Cost > 0 {
+				continue
+			}
+			ports = append(ports, &status.Ports[i])
+		}
+		return ports
+	}
+	// Label is referencing single port.
+	for i := range status.Ports {
+		if status.Ports[i].Logicallabel == label {
+			ports = append(ports, &status.Ports[i])
+			return ports
 		}
 	}
 	return nil
@@ -1443,6 +1468,20 @@ func (status DeviceNetworkStatus) HasErrors() bool {
 	return false
 }
 
+// GetPortAddrInfo returns address info for a given interface and its IP address.
+func (status DeviceNetworkStatus) GetPortAddrInfo(ifname string, addr net.IP) *AddrInfo {
+	portStatus := status.GetPortByIfName(ifname)
+	if portStatus == nil {
+		return nil
+	}
+	for i := range portStatus.AddrInfoList {
+		if portStatus.AddrInfoList[i].Addr.Equal(addr) {
+			return &portStatus.AddrInfoList[i]
+		}
+	}
+	return nil
+}
+
 func rotate(arr []string, amount int) []string {
 	if len(arr) == 0 {
 		return []string{}
@@ -1454,50 +1493,58 @@ func rotate(arr []string, amount int) []string {
 // GetMgmtPortsSortedCost returns all management ports sorted by port cost
 // rotation causes rotation/round-robin within each cost
 func GetMgmtPortsSortedCost(globalStatus DeviceNetworkStatus, rotation int) []string {
-	return getMgmtPortsSortedCostImpl(globalStatus, rotation,
-		PortCostMax, false)
+	return getPortsSortedCostImpl(globalStatus, rotation,
+		PortCostMax, true, false)
+}
+
+// GetAllPortsSortedCost returns all ports (management and app shared) sorted by port cost.
+// Rotation causes rotation/round-robin within each cost.
+func GetAllPortsSortedCost(globalStatus DeviceNetworkStatus, rotation int) []string {
+	return getPortsSortedCostImpl(globalStatus, rotation,
+		PortCostMax, false, false)
 }
 
 // GetMgmtPortsSortedCostWithoutFailed returns all management ports sorted by
 // port cost ignoring ports with failures.
 // rotation causes rotation/round-robin within each cost
 func GetMgmtPortsSortedCostWithoutFailed(globalStatus DeviceNetworkStatus, rotation int) []string {
-	return getMgmtPortsSortedCostImpl(globalStatus, rotation,
-		PortCostMax, true)
+	return getPortsSortedCostImpl(globalStatus, rotation,
+		PortCostMax, true, true)
 }
 
-// getMgmtPortsSortedCostImpl returns all management ports sorted by port cost
+// getPortsSortedCostImpl returns all ports sorted by port cost
 // up to and including the maxCost
-func getMgmtPortsSortedCostImpl(globalStatus DeviceNetworkStatus, rotation int, maxCost uint8, dropFailed bool) []string {
+func getPortsSortedCostImpl(globalStatus DeviceNetworkStatus, rotation int, maxCost uint8,
+	mgmtOnly, dropFailed bool) []string {
 	ifnameList := []string{}
 	costList := getPortCostListImpl(globalStatus, maxCost)
 	for _, cost := range costList {
 		ifnameList = append(ifnameList,
-			getMgmtPortsImpl(globalStatus, rotation, true, cost, dropFailed)...)
+			getPortsImpl(globalStatus, rotation, true, cost, mgmtOnly, dropFailed)...)
 	}
 	return ifnameList
 }
 
 // GetMgmtPortsAny returns all management ports
 func GetMgmtPortsAny(globalStatus DeviceNetworkStatus, rotation int) []string {
-	return getMgmtPortsImpl(globalStatus, rotation, false, 0, false)
+	return getPortsImpl(globalStatus, rotation, false, 0, true, false)
 }
 
 // GetMgmtPortsByCost returns all management ports with a given port cost
 func GetMgmtPortsByCost(globalStatus DeviceNetworkStatus, cost uint8) []string {
-	return getMgmtPortsImpl(globalStatus, 0, true, cost, false)
+	return getPortsImpl(globalStatus, 0, true, cost, true, false)
 }
 
 // Returns the IfNames.
-func getMgmtPortsImpl(globalStatus DeviceNetworkStatus, rotation int,
-	matchCost bool, cost uint8, dropFailed bool) []string {
+func getPortsImpl(globalStatus DeviceNetworkStatus, rotation int,
+	matchCost bool, cost uint8, mgmtOnly, dropFailed bool) []string {
 
 	var ifnameList []string
 	for _, us := range globalStatus.Ports {
 		if matchCost && us.Cost != cost {
 			continue
 		}
-		if globalStatus.Version >= DPCIsMgmt &&
+		if mgmtOnly && globalStatus.Version >= DPCIsMgmt &&
 			!us.IsMgmt {
 			continue
 		}
@@ -1719,8 +1766,8 @@ func getLocalAddrListImpl(globalStatus DeviceNetworkStatus,
 	var ignoreErrors bool
 	if ifname == "" {
 		// Get interfaces in cost order
-		ifnameList = getMgmtPortsSortedCostImpl(globalStatus, 0,
-			maxCost, false)
+		ifnameList = getPortsSortedCostImpl(globalStatus, 0,
+			maxCost, true, false)
 		// If we are looking across all interfaces, then We ignore errors
 		// since we get them if there are no addresses on a ports
 		ignoreErrors = true
@@ -1932,6 +1979,7 @@ func LogicallabelToIfName(deviceNetworkStatus *DeviceNetworkStatus,
 }
 
 // IsAnyPortInPciBack
+//
 //	Checks if any of the Ports are part of IO bundles which are in PCIback.
 //	If true, it also returns the ifName ( NOT bundle name )
 //	Also returns whether it is currently used by an application by
@@ -1970,55 +2018,6 @@ const (
 	MST_SUPPORT_SERVER
 	MST_LAST = 255
 )
-
-// CurrIntfStatusType - enum for probe current uplink intf UP/Down status
-type CurrIntfStatusType uint8
-
-// CurrentIntf status
-const (
-	CurrIntfNone CurrIntfStatusType = iota
-	CurrIntfDown
-	CurrIntfUP
-)
-
-// ServerProbe - remote probe info configured from the cloud
-type ServerProbe struct {
-	ServerURL     string // include method,host,paths
-	ServerIP      net.IP
-	ProbeInterval uint32 // probe frequency in seconds
-}
-
-// ProbeInfo - per phyical port probing info
-type ProbeInfo struct {
-	IfName    string
-	IsPresent bool // for GC purpose
-	TransDown bool // local up long time, transition to down
-	// local nexthop probe state
-	GatewayUP  bool // local nexthop is in UP state
-	LocalAddr  net.IP
-	NhAddr     net.IP
-	FailedCnt  uint32 // continuous ping fail count, reset when ping success
-	SuccessCnt uint32 // contiguous ping success count, reset when ping fail
-
-	Cost uint8
-	// remote host probe state
-	RemoteHostUP    bool   // remote host is in UP state
-	FailedProbeCnt  uint32 // continuous remote ping fail count, reset when ping success
-	SuccessProbeCnt uint32 // continuous remote ping success count, reset when ping fail
-	AveLatency      int64  // average delay in msec
-}
-
-// NetworkInstanceProbeStatus - probe status per network instance
-type NetworkInstanceProbeStatus struct {
-	PConfig           ServerProbe          // user configuration for remote server
-	NeedIntfUpdate    bool                 // flag to indicate the CurrentUpLinkIntf status has changed
-	PrevUplinkIntf    string               // previously used uplink interface
-	CurrentUplinkIntf string               // decided by local/remote probing
-	ProgUplinkIntf    string               // Currently programmed uplink interface for app traffic
-	CurrIntfUP        CurrIntfStatusType   // the current picked interface can be up or down
-	TriggerCnt        uint32               // number of times Uplink change triggered
-	PInfo             map[string]ProbeInfo // per physical port eth0, eth1 probing state
-}
 
 type DhcpType uint8
 
@@ -2318,25 +2317,25 @@ type VlanMetrics struct {
 
 // ProbeMetrics - NI probe metrics
 type ProbeMetrics struct {
-	CurrUplinkIntf  string             // the uplink interface probing picks
-	RemoteEndpoint  string             // remote either URL or IP address
-	LocalPingIntvl  uint32             // local ping interval in seconds
-	RemotePingIntvl uint32             // remote probing interval in seconds
-	UplinkNumber    uint32             // number of possible uplink interfaces
-	IntfProbeStats  []ProbeIntfMetrics // per dom0 intf uplink probing metrics
+	SelectedUplinkIntf string             // the uplink interface that probing picked
+	RemoteEndpoints    []string           // remote IP/URL addresses used for probing
+	LocalPingIntvl     uint32             // local ping interval in seconds
+	RemotePingIntvl    uint32             // remote probing interval in seconds
+	UplinkCount        uint32             // number of possible uplink interfaces
+	IntfProbeStats     []ProbeIntfMetrics // per dom0 intf uplink probing metrics
 }
 
 // ProbeIntfMetrics - per dom0 network uplink interface probing
 type ProbeIntfMetrics struct {
-	IntfName        string // dom0 uplink interface name
-	NexthopGw       net.IP // interface local ping nexthop address
-	GatewayUP       bool   // Is local gateway in UP status
-	RmoteStatusUP   bool   // Is remote endpoint in UP status
-	GatewayUPCnt    uint32 // local ping UP count
-	GatewayDownCnt  uint32 // local ping DOWN count
-	RemoteUPCnt     uint32 // remote probe UP count
-	RemoteDownCnt   uint32 // remote probe DOWN count
-	LatencyToRemote uint32 // probe latency to remote in msec
+	IntfName        string   // dom0 uplink interface name
+	NexthopIPs      []net.IP // interface local next-hop address(es) used for probing
+	NexthopUP       bool     // Is local next-hop in UP status
+	RemoteUP        bool     // Is remote endpoint in UP status
+	NexthopUPCnt    uint32   // local ping UP count
+	NexthopDownCnt  uint32   // local ping DOWN count
+	RemoteUPCnt     uint32   // remote probe UP count
+	RemoteDownCnt   uint32   // remote probe DOWN count
+	LatencyToRemote uint32   // probe latency to remote in msec
 }
 
 func (metrics NetworkInstanceMetrics) Key() string {
@@ -2482,8 +2481,9 @@ const (
 )
 
 // NetworkInstanceConfig
-//		Config Object for NetworkInstance
-// 		Extracted from the protobuf NetworkInstanceConfig
+//
+//	Config Object for NetworkInstance
+//	Extracted from the protobuf NetworkInstanceConfig
 type NetworkInstanceConfig struct {
 	UUIDandVersion
 	DisplayName string
@@ -2567,6 +2567,44 @@ func (config *NetworkInstanceConfig) IsIPv6() bool {
 	return false
 }
 
+// WithUplinkProbing returns true if the network instance is eligible for uplink
+// probing (see pkg/pillar/uplinkprober).
+// Uplink probing is performed only for L3 networks with non-empty "shared" uplink
+// label, matching a subset of uplink ports.
+// Even if a network instance is eligible for probing as determined by this method,
+// the actual process of connectivity probing may still be inactive if there are
+// no uplink ports available that match the label.
+func (config *NetworkInstanceConfig) WithUplinkProbing() bool {
+	switch config.Type {
+	case NetworkInstanceTypeLocal, NetworkInstanceTypeCloud:
+		return IsSharedPortLabel(config.Logicallabel)
+	default:
+		return false
+	}
+}
+
+const (
+	// UplinkLabel references all management interfaces.
+	UplinkLabel = "uplink"
+	// FreeUplinkLabel references all management interfaces with 0 cost.
+	FreeUplinkLabel = "freeuplink"
+)
+
+// IsSharedPortLabel : returns true if the logical label references multiple
+// ports.
+// Currently used labels are:
+//   - "uplink": any management interface
+//   - "freeuplink": any management interface with 0 cost
+func IsSharedPortLabel(label string) bool {
+	switch label {
+	case UplinkLabel:
+		return true
+	case FreeUplinkLabel:
+		return true
+	}
+	return false
+}
+
 type ChangeInProgressType int32
 
 const (
@@ -2578,8 +2616,9 @@ const (
 )
 
 // NetworkInstanceStatus
-//		Config Object for NetworkInstance
-// 		Extracted from the protobuf NetworkInstanceConfig
+//
+//	Config Object for NetworkInstance
+//	Extracted from the protobuf NetworkInstanceConfig
 type NetworkInstanceStatus struct {
 	NetworkInstanceConfig
 	// Make sure the Activate from the config isn't exposed as a boolean
@@ -2598,7 +2637,8 @@ type NetworkInstanceStatus struct {
 	OpaqueStatus string
 	VpnStatus    *VpnStatus
 
-	NetworkInstanceProbeStatus
+	SelectedUplinkIntf string // Decided by local/remote probing
+	ProgUplinkIntf     string // Currently programmed uplink interface for app traffic
 }
 
 // LogCreate :
@@ -3215,29 +3255,6 @@ func (data AppInstMetaData) Key() string {
 	return data.AppInstUUID.String() + "-" + string(data.Type)
 }
 
-// Bitmap :
-// Bitmap of the reserved and allocated resources
-// Keeps 256 bits indexed by 0 to 255.
-type Bitmap [32]byte
-
-// IsSet :
-// Test the bit value
-func (bits *Bitmap) IsSet(i int) bool {
-	return bits[i/8]&(1<<uint(7-i%8)) != 0
-}
-
-// Set :
-// Set the bit value
-func (bits *Bitmap) Set(i int) {
-	bits[i/8] |= 1 << uint(7-i%8)
-}
-
-// Clear :
-// Clear the bit value
-func (bits *Bitmap) Clear(i int) {
-	bits[i/8] &^= 1 << uint(7-i%8)
-}
-
 // AddToIP :
 func AddToIP(ip net.IP, addition int) net.IP {
 	if addr := ip.To4(); addr != nil {
@@ -3285,14 +3302,11 @@ func GetIPBroadcast(subnet net.IPNet) net.IP {
 	return net.IP{}
 }
 
-// PS. Any change to BitMapMax, must be
-// reflected in the BitMap Size(32 bytes)
 // At the MinSubnetSize there is room for one app instance (.0 being reserved,
 // .3 broadcast, .1 is the bridgeIPAddr, and .2 is usable).
 const (
-	BitMapMax       = 255 // with 0 base, its 256
-	MinSubnetSize   = 4   // minimum Subnet Size
-	LargeSubnetSize = 16  // for determining default Dhcp Range
+	MinSubnetSize   = 4  // minimum Subnet Size
+	LargeSubnetSize = 16 // for determining default Dhcp Range
 )
 
 // WwanConfig is published by nim and consumed by the wwan service.
@@ -3330,7 +3344,10 @@ type WwanNetworkConfig struct {
 	LogicalLabel string        `json:"logical-label"`
 	PhysAddrs    WwanPhysAddrs `json:"physical-addrs"`
 	// XXX Multiple APNs are not yet supported.
-	Apns  []string  `json:"apns"`
+	Apns []string `json:"apns"`
+	// Proxies configured for the cellular network.
+	Proxies []ProxyEntry `json:"proxies"`
+	// Probe used to detect broken connection.
 	Probe WwanProbe `json:"probe"`
 	// Some LTE modems have GNSS receiver integrated and can be used
 	// for device location tracking.
@@ -3359,6 +3376,14 @@ func (wnc WwanNetworkConfig) Equal(wnc2 WwanNetworkConfig) bool {
 	if wnc.Probe.Address != wnc2.Probe.Address ||
 		wnc.Probe.Disable != wnc2.Probe.Disable {
 		return false
+	}
+	if len(wnc.Proxies) != len(wnc2.Proxies) {
+		return false
+	}
+	for i := range wnc.Proxies {
+		if wnc.Proxies[i] != wnc2.Proxies[i] {
+			return false
+		}
 	}
 	if wnc.LocationTracking != wnc2.LocationTracking {
 		return false
@@ -3474,9 +3499,10 @@ type WwanCellModule struct {
 
 // WwanSimCard contains SIM card information.
 type WwanSimCard struct {
-	Name  string `json:"name,omitempty"`
-	ICCID string `json:"iccid"`
-	IMSI  string `json:"imsi"`
+	Name   string `json:"name,omitempty"`
+	ICCID  string `json:"iccid"`
+	IMSI   string `json:"imsi"`
+	Status string `json:"status"`
 }
 
 // WwanProvider contains information about a cellular connectivity provider.

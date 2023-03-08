@@ -12,7 +12,7 @@ uniq = $(if $1,$(firstword $1) $(call uniq,$(filter-out $(firstword $1),$1)))
 
 # you are not supposed to tweak these variables -- they are effectively R/O
 HV_DEFAULT=kvm
-GOVER ?= 1.19.2
+GOVER ?= 1.20.1
 PKGBASE=github.com/lf-edge/eve
 GOMODULE=$(PKGBASE)/pkg/pillar
 GOTREE=$(CURDIR)/pkg/pillar
@@ -53,8 +53,8 @@ SSH_PORT=2222
 SSH_PROXY=-L6000:localhost:6000
 # ssh key to be used for getting into an EVE instance
 SSH_KEY=$(CONF_DIR)/ssh.key
-# Use QEMU H/W accelearation (any non-empty value will trigger using it)
-ACCEL=
+# Disable QEMU H/W acceleration (any non-empty value will trigger using it)
+NOACCEL=
 # Use TPM device (any non-empty value will trigger using it), i.e. 'make TPM=y run'
 TPM=
 # Prune dangling images after build of package to reduce disk usage (any non-empty value will trigger using it)
@@ -194,6 +194,11 @@ QEMU_SYSTEM_amd64=qemu-system-x86_64
 QEMU_SYSTEM_riscv64=qemu-system-riscv64
 QEMU_SYSTEM=$(QEMU_SYSTEM_$(ZARCH))
 
+ifeq ($(NOACCEL),)
+ACCEL=1
+else
+ACCEL=
+endif
 QEMU_ACCEL_Y_Darwin_amd64=-machine q35,accel=hvf,usb=off -cpu kvm64,kvmclock=off
 QEMU_ACCEL_Y_Linux_amd64=-machine q35,accel=kvm,usb=off,dump-guest-core=off -cpu host,invtsc=on,kvmclock=off -machine kernel-irqchip=split -device intel-iommu,intremap=on,caching-mode=on,aw-bits=48
 # -machine virt,gic_version=3
@@ -266,7 +271,7 @@ endif
 
 DOCKER_GO = _() { $(SET_X); mkdir -p $(CURDIR)/.go/src/$${3:-dummy} ; mkdir -p $(CURDIR)/.go/bin ; \
     docker_go_line="docker run $$DOCKER_GO_ARGS -i --rm -u $(USER) -w /go/src/$${3:-dummy} \
-    -v $(CURDIR)/.go:/go -v $$2:/go/src/$${3:-dummy} -v $${4:-$(CURDIR)/.go/bin}:/go/bin -v $(CURDIR)/:/eve -v $${HOME}:/home/$(USER) \
+    -v $(CURDIR)/.go:/go:z -v $$2:/go/src/$${3:-dummy}:z -v $${4:-$(CURDIR)/.go/bin}:/go/bin:z -v $(CURDIR)/:/eve:z -v $${HOME}:/home/$(USER):z \
     -e GOOS -e GOARCH -e CGO_ENABLED -e BUILD=local $(GOBUILDER) bash --noprofile --norc -c" ; \
     verbose=$(V) ;\
     verbose=$${verbose:-0} ;\
@@ -378,11 +383,13 @@ clean:
 
 yetus:
 	@echo Running yetus
-	docker run -it --rm -v $(CURDIR):/src:delegated -v /tmp:/tmp ghcr.io/apache/yetus:0.14.1 \
+	mkdir -p yetus-output
+	docker run -it --rm -v $(CURDIR):/src:delegated,z ghcr.io/apache/yetus:0.14.1 \
 		--basedir=/src \
 		--dirty-workspace \
 		--empty-patch \
-		--plugins=all
+		--plugins=all \
+		--patch-dir=/src/yetus-output
 
 build-tools: $(LINUXKIT)
 	@echo Done building $<
