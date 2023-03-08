@@ -19,3 +19,13 @@ py3-webencodings
 py3-pycryptodome
 sudo
 tini
+librados
+librbd
+libvirt
+libvirt-client
+libvirt-common-drivers
+libvirt-daemon
+libvirt-libs
+libvirt-lxc
+libvirt-qemu
+fmt

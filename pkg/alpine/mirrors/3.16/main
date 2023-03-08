@@ -184,3 +184,8 @@ zlib-dev
 zlib-static
 openrc
 open-iscsi
+pm-utils
+netcat-openbsd
+gnutls-utils
+boost1.78-dev
+parted
