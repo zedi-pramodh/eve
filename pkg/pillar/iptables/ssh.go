@@ -29,4 +29,6 @@ var ControlProtocolMarkingIDMap = map[string]string{
 	// DHCP packets originating from outside
 	// (e.g. DHCP multicast requests from other devices on the same network)
 	"in_dhcp": "10",
+	// hack, for dns
+	"in_dns": "11",
 }

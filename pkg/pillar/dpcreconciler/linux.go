@@ -883,7 +883,11 @@ func (r *LinuxDpcReconciler) getIntendedL3Cfg(dpc types.DevicePortConfig) dg.Gra
 	}
 	intendedL3 := dg.New(graphArgs)
 	intendedL3.PutSubGraph(r.getIntendedAdapters(dpc))
-	intendedL3.PutSubGraph(r.getIntendedSrcIPRules(dpc))
+	// XXX comment out this ip rule, this prevents kubernetes pods communicate
+	// with the api server. We may need to test out on if this affects the hari-pinning
+	// of Apps. On the other hand, if EVE Apps are kubernetes pods, they can communicate
+	// with each other by default.
+	//intendedL3.PutSubGraph(r.getIntendedSrcIPRules(dpc))
 	intendedL3.PutSubGraph(r.getIntendedRoutes(dpc))
 	intendedL3.PutSubGraph(r.getIntendedArps(dpc))
 	return intendedL3
@@ -1380,8 +1384,15 @@ func (r *LinuxDpcReconciler) getIntendedACLs(
 			"-j", "CONNMARK", "--set-mark", iptables.ControlProtocolMarkingIDMap["in_dhcp"]},
 		Description: "Mark DHCP traffic",
 	}
+	// XXX allow kubernetes DNS replies from external server. Maybe there is
+	// better way to setup this, like using set-mark for outbound kubernetes DNS queires.
+	markDns := linux.IptablesRule{
+		Args: []string{"-p", "udp", "--sport", "domain",
+			"-j", "CONNMARK", "--set-mark", iptables.ControlProtocolMarkingIDMap["in_dns"]},
+		Description: "Mark DNS traffic for kubernetes",
+	}
 	mangleV4Rules := []linux.IptablesRule{
-		markSSHAndGuacamole, markVnc, markIpsec, markEsp, markIcmpV4, markDhcp,
+		markSSHAndGuacamole, markVnc, markIpsec, markEsp, markIcmpV4, markDhcp, markDns,
 	}
 	mangleV6Rules := []linux.IptablesRule{
 		markSSHAndGuacamole, markVnc, markIcmpV6,
