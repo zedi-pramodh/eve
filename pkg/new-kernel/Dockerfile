@@ -54,10 +54,15 @@ FROM kernel-cross-build-target AS kernel-target-riscv64-build-arm64
 
 # use kernel-build-base-native image as a base for the rest of target and build archs
 FROM kernel-build-base-native AS kernel-target-amd64-build-amd64
+ENV EVE_TARGET_ARCH=x86_64
 FROM kernel-build-base-native AS kernel-target-amd64-build-riscv64
+ENV EVE_TARGET_ARCH=riscv64
 FROM kernel-build-base-native AS kernel-target-arm64-build-arm64
+ENV EVE_TARGET_ARCH=aarch64
 FROM kernel-build-base-native AS kernel-target-arm64-build-riscv64
+ENV EVE_TARGET_ARCH=riscv64
 FROM kernel-build-base-native AS kernel-target-riscv64-build-riscv64
+ENV EVE_TARGET_ARCH=riscv64
 
 # set versions for arm64
 # hadolint ignore=DL3006
@@ -153,7 +158,7 @@ RUN KERNEL_DEF_CONF="/linux/arch/${KERNEL_ARCH}/configs/${KERNEL_DEFCONFIG}"; \
         fi && \
         cat /kernel_config"${EXTRA}" >> "${KERNEL_DEF_CONF}"; \
     fi && \
-    sed -i "s/CONFIG_CC_VERSION_TEXT=\"gcc/CONFIG_CC_VERSION_TEXT=\"${CROSS_COMPILE_ENV}gcc/" "${KERNEL_DEF_CONF}" &&  \
+    sed -i "s/CONFIG_CC_VERSION_TEXT=\"gcc/CONFIG_CC_VERSION_TEXT=\"${CROSS_COMPILE_ENV}gcc/" "${KERNEL_DEF_CONF}" && \
     cp "${KERNEL_DEF_CONF}" .config && \
     cp "${KERNEL_DEF_CONF}" .config.new && \
     make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" olddefconfig ; \
@@ -196,7 +201,7 @@ RUN    ./copy-builtin /linux
 # Verify kconfig after ZFS is prepared as built-in
 WORKDIR /linux
 RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" "${KERNEL_DEFCONFIG}"
-RUN set -x ; make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig
+RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig
 #RUN diff -cw .config .config.new
 
 # Make kernel
