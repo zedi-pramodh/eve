@@ -29,20 +29,22 @@ FROM ${EVE_ALPINE_IMAGE} AS cross-compile-libs
 ENV PKGS musl-dev libgcc
 RUN eve-alpine-deploy.sh
 
-# adjust TARGET_ARCH for cross-compiler
+# adjust EVE_TARGET_ARCH for cross-compiler
 FROM kernel-build-base-cross AS kernel-cross-target-arm64
-ENV TARGET_ARCH=aarch64
+ENV EVE_TARGET_ARCH=aarch64
+FROM kernel-build-base-cross AS kernel-cross-target-amd64
+ENV EVE_TARGET_ARCH=x86_64
 FROM kernel-build-base-cross AS kernel-cross-target-riscv64
-ENV TARGET_ARCH=riscv64
+ENV EVE_TARGET_ARCH=riscv64
 
 # install cross-compile packages and libs for target
 # hadolint ignore=DL3006
 FROM kernel-cross-target-${TARGETARCH} AS kernel-cross-build-target
-ENV CROSS_COMPILE_ENV="${TARGET_ARCH}"-alpine-linux-musl-
+ENV CROSS_COMPILE_ENV="${EVE_TARGET_ARCH}"-alpine-linux-musl-
 COPY --from=cross-compilers /packages /packages
-# hadolint ignore=DL3018
-RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${TARGET_ARCH}"
-COPY --from=cross-compile-libs /out/ /usr/"${TARGET_ARCH}"-alpine-linux-musl/
+# hadolinb ignore=DL3018
+RUN apk add --no-cache --allow-untrusted -X /packages build-base-"${EVE_TARGET_ARCH}"
+COPY --from=cross-compile-libs /out/ /usr/"${EVE_TARGET_ARCH}"-alpine-linux-musl/
 
 # support cross compile from amd64 and arm64 for now
 FROM kernel-cross-build-target AS kernel-target-arm64-build-amd64
@@ -71,7 +73,7 @@ ENV KERNEL_DEFCONFIG=defconfig
 # set versions for amd64
 # hadolint ignore=DL3006
 FROM kernel-target-${TARGETARCH}-build-${BUILDARCH} AS kernel-target-amd64
-ARG KERNEL_VERSION_amd64=5.15.46
+ARG KERNEL_VERSION_amd64=5.15.90
 # this has to be specified separately because of dockerfile limitations
 ARG KERNEL_MAJOR=5
 ENV KERNEL_VERSION=${KERNEL_VERSION_amd64}
@@ -90,14 +92,21 @@ ENV KERNEL_MAJOR=${KERNEL_MAJOR}
 ENV KERNEL_ARCH=riscv
 ENV KERNEL_DEFCONFIG=defconfig
 
+ENV BUILDARCH=${BUILDPLATFORM}
+
 # build for all arches
 # hadolint ignore=DL3006
 FROM kernel-target-${TARGETARCH} AS kernel-build
+ARG BUILDARCH
 
 # We copy the entire directory. This copies some unneeded files, but
 # allows us to check for the existence /patches-${KERNEL_SERIES} to
 # build kernels without patches.
 COPY / /
+# will work later, depends on pkg/alpine changes
+#COPY /kernel-config/* /
+#COPY /patches-5.15.x /patches-5.15.x
+#COPY /patches-zfs-2.1.2 /patches-zfs-2.1.2
 
 ARG KERNEL_SOURCE=https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/linux-${KERNEL_VERSION}.tar.xz
 ARG KERNEL_SHA256_SUMS=https://www.kernel.org/pub/linux/kernel/v${KERNEL_MAJOR}.x/sha256sums.asc
@@ -136,7 +145,7 @@ RUN set -e ; KERNEL_SERIES="${KERNEL_VERSION%.*}".x; \
 # hadolint ignore=SC2086
 RUN KERNEL_DEF_CONF="/linux/arch/${KERNEL_ARCH}/configs/${KERNEL_DEFCONFIG}"; \
     KERNEL_SERIES="${KERNEL_VERSION%.*}".x; \
-    cp /kernel_config-"${KERNEL_SERIES}"-"${TARGET_ARCH}" "${KERNEL_DEF_CONF}"; \
+    cp /kernel_config-"${KERNEL_SERIES}"-"${EVE_TARGET_ARCH}" "${KERNEL_DEF_CONF}"; \
     if [ -n "${EXTRA}" ]; then \
         sed -i "s/CONFIG_LOCALVERSION=\"-linuxkit\"/CONFIG_LOCALVERSION=\"-linuxkit${EXTRA}\"/" "${KERNEL_DEF_CONF}"; \
         if [ "${EXTRA}" = "-dbg" ]; then \
@@ -144,9 +153,10 @@ RUN KERNEL_DEF_CONF="/linux/arch/${KERNEL_ARCH}/configs/${KERNEL_DEFCONFIG}"; \
         fi && \
         cat /kernel_config"${EXTRA}" >> "${KERNEL_DEF_CONF}"; \
     fi && \
-    sed -i "s/CONFIG_CC_VERSION_TEXT=\"gcc/CONFIG_CC_VERSION_TEXT=\"${CROSS_COMPILE_ENV}gcc/" "${KERNEL_DEF_CONF}" && \
+    sed -i "s/CONFIG_CC_VERSION_TEXT=\"gcc/CONFIG_CC_VERSION_TEXT=\"${CROSS_COMPILE_ENV}gcc/" "${KERNEL_DEF_CONF}" &&  \
     cp "${KERNEL_DEF_CONF}" .config && \
     cp "${KERNEL_DEF_CONF}" .config.new && \
+    make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" olddefconfig ; \
     make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" prepare
 
 # Prepare built-in ZFS
@@ -171,25 +181,27 @@ RUN set -e; \
             patch -p1 < "$patch"; \
         done \
     fi
+
+RUN echo "${EVE_TARGET_ARCH} ${BUILDARCH}"
 RUN ./autogen.sh && \
     CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" ./configure \
         --with-linux=/linux \
         --with-linux-obj=/linux \
         --with-config=kernel  \
         --enable-linux-builtin  \
-        --host="${TARGET_ARCH}"-linux-musl --build="${BUILD_ARCH}"-linux-musl && \
-    ./scripts/make_gitrev.sh && \
-    ./copy-builtin /linux
+        --host="${EVE_TARGET_ARCH}"-linux-musl --build="${BUILDARCH}"-linux-musl
+RUN    ./scripts/make_gitrev.sh
+RUN    ./copy-builtin /linux
 
 # Verify kconfig after ZFS is prepared as built-in
 WORKDIR /linux
-RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" "${KERNEL_DEFCONFIG}" && \
-    make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig && \
-    diff -cw .config .config.new
+RUN make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" "${KERNEL_DEFCONFIG}"
+RUN set -x ; make CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" oldconfig
+#RUN diff -cw .config .config.new
 
 # Make kernel
 RUN make -j "$(getconf _NPROCESSORS_ONLN)" CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" KCFLAGS="-fno-pie" && \
-    case ${TARGET_ARCH} in \
+    case ${EVE_TARGET_ARCH} in \
     x86_64) \
         cp arch/x86_64/boot/bzImage /out/kernel; \
         ;; \
@@ -217,7 +229,7 @@ RUN tar -zxvf /tmp/rtl8821CU.tgz --strip-components=1 && \
     rm /tmp/rtl8821CU.tgz
 
 WORKDIR /linux
-RUN if [ "${TARGET_ARCH}" != riscv64 ]; then \
+RUN if [ "${EVE_TARGET_ARCH}" != riscv64 ]; then \
         make -j "$(getconf _NPROCESSORS_ONLN)" -C /tmp/rtl8821CU KSRC=/linux CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" modules && \
         install -D -p -m 644 /tmp/rtl8821CU/8821cu.ko $(echo /tmp/kernel-modules/lib/modules/*)/kernel/drivers/net/wireless/realtek/rtl8821cu/8821cu.ko ;\
     fi
@@ -225,10 +237,10 @@ RUN if [ "${TARGET_ARCH}" != riscv64 ]; then \
 WORKDIR /linux
 
 # Strip at least some of the modules to conserve space
-RUN [ "${TARGET_ARCH}" = x86_64 ] || "${CROSS_COMPILE_ENV}strip" --strip-debug `find /tmp/kernel-modules/lib/modules -name \*.ko`
+RUN [ "${EVE_TARGET_ARCH}" = x86_64 ] || "${CROSS_COMPILE_ENV}strip" --strip-debug `find /tmp/kernel-modules/lib/modules -name \*.ko`
 
 # Device Tree Blobs
-RUN [ "${TARGET_ARCH}" = x86_64 ] || make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" dtbs_install
+RUN [ "${EVE_TARGET_ARCH}" = x86_64 ] || make INSTALL_DTBS_PATH=/tmp/kernel-modules/boot/dtb CROSS_COMPILE="${CROSS_COMPILE_ENV}" ARCH="${KERNEL_ARCH}" dtbs_install
 
 # Package all the modules up
 # hadolint ignore=SC2086
