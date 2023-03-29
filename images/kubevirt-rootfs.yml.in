@@ -1,5 +1,5 @@
 kernel:
-  image: KERNEL_TAG
+  image: NEW_KERNEL_TAG
   cmdline: "rootdelay=3"
 init:
   - linuxkit/init:8f1e6a0747acbbb4d7e24dc98f97faa8d1c6cec7
@@ -87,6 +87,10 @@ services:
   - name: xen-tools
     image: XENTOOLS_TAG
     cgroupsPath: /eve/services/xen-tools
+    oomScoreAdj: -999
+  - name: eve-k3s 
+    image: K3S_TAG
+    cgroupsPath: /eve/services/eve-k3s
     oomScoreAdj: -999
 files:
   - path: /etc/eve-release

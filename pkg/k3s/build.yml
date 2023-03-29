@@ -1,6 +1,6 @@
 # linuxkit build template 
 #
-# Copyright (c) 2018 Zededa, Inc.
+# Copyright (c) 2023 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 org: lfedge
 image: eve-k3s
@@ -23,4 +23,3 @@ config:
   devices:
     - path: all
       type: a
-

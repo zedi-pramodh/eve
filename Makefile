@@ -1,4 +1,3 @@
-
 # Copyright (c) 2018 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 #
@@ -160,6 +159,11 @@ BOOT_PART=$(INSTALLER)/boot
 BSP_IMX_PART=$(INSTALLER)/bsp-imx
 
 SBOM=$(ROOTFS).spdx.json
+
+ROOTFS_YML=images/rootfs.yml.in
+ifeq ($(HV),kubevirt)
+ROOTFS_YML=images/kubevirt-rootfs.yml.in
+endif
 
 DEVICETREE_DTB_amd64=
 DEVICETREE_DTB_arm64=$(DIST)/dtb/eve.dtb
@@ -601,8 +605,8 @@ $(ROOTFS_IMG): $(ROOTFS_TAR) | $(INSTALLER)
 	$(QUIET): $@: Begin
 	./tools/makerootfs.sh imagefromtar -t $(ROOTFS_TAR) -i $@ -f $(ROOTFS_FORMAT) -a $(ZARCH)
 	@echo "size of $@ is $$(wc -c < "$@")B"
-	@[ $$(wc -c < "$@") -gt $$(( 250 * 1024 * 1024 )) ] && \
-	        echo "ERROR: size of $@ is greater than 250MB (bigger than allocated partition)" && exit 1 || :
+	@[ $$(wc -c < "$@") -gt $$(( 300 * 1024 * 1024 )) ] && \
+	        echo "ERROR: size of $@ is greater than 300MB (bigger than allocated partition)" && exit 1 || :
 	$(QUIET): $@: Succeeded
 
 $(SBOM): $(ROOTFS_TAR) | $(INSTALLER)
@@ -844,15 +848,15 @@ eve-%: pkg/%/Dockerfile build-tools $(RESCAN_DEPS)
 	$(eval LINUXKIT_BUILD_PLATFORMS_LIST := $(call uniq,linux/$(ZARCH) $(if $(filter $(PKGS_HOSTARCH),$*),linux/$(HOSTARCH),)))
 	$(eval LINUXKIT_BUILD_PLATFORMS := --platforms $(subst $(space),$(comma),$(strip $(LINUXKIT_BUILD_PLATFORMS_LIST))))
 	$(eval LINUXKIT_FLAGS := $(if $(filter manifest,$(LINUXKIT_PKG_TARGET)),,$(FORCE_BUILD) $(LINUXKIT_DOCKER_LOAD) $(LINUXKIT_BUILD_PLATFORMS)))
-	$(QUIET)$(LINUXKIT) $(DASH_V) pkg $(LINUXKIT_PKG_TARGET) $(LINUXKIT_OPTS) $(LINUXKIT_FLAGS) -build-yml $(call get_pkg_build_yml,$*) pkg/$*
+	$(QUIET)$(LINUXKIT) $(DASH_V) pkg $(LINUXKIT_PKG_TARGET) -network $(LINUXKIT_OPTS) $(LINUXKIT_FLAGS) -build-yml $(call get_pkg_build_yml,$*) pkg/$*
 	$(QUIET)if [ -n "$(PRUNE)" ]; then \
   		$(LINUXKIT) pkg builder prune; \
   		docker image prune -f; \
   	fi
 	$(QUIET): "$@: Succeeded (intermediate for pkg/%)"
 
-images/rootfs-%.yml.in: images/rootfs.yml.in FORCE
-	$(QUITE)tools/compose-image-yml.sh $< $@ "$(ROOTFS_VERSION)-$*-$(ZARCH)"
+images/rootfs-%.yml.in: ${ROOTFS_YML} FORCE
+	$(QUITE)tools/compose-image-yml.sh $< $@ "$(ROOTFS_VERSION)-$*-$(ZARCH)"; \
 
 images-patches := $(wildcard images/*.yq)
 test-images-patches: $(images-patches:%.yq=%)

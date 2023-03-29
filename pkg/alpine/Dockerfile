@@ -15,7 +15,7 @@ COPY build-cache.sh /bin/
 
 RUN mkdir -vp "/mirror/edge/$(apk --print-arch)"
 # download newest go=1.20.1 from alpine/edge repository
-RUN wget -q "http://dl-cdn.alpinelinux.org/alpine/edge/community/$(apk --print-arch)/go-1.20.1-r0.apk" -O "/mirror/edge/$(apk --print-arch)/go-1.20.1-r0.apk"
+RUN wget -q "http://dl-cdn.alpinelinux.org/alpine/edge/community/$(apk --print-arch)/go-1.20.2-r1.apk" -O "/mirror/edge/$(apk --print-arch)/go-1.20.2-r1.apk"
 # install abuild for signing (which requires gcc as well)
 RUN apk add --no-cache abuild gcc sudo
 
