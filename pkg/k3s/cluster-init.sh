@@ -3,9 +3,9 @@
 # Copyright (c) 2023 Zededa, Inc.
 # SPDX-License-Identifier: Apache-2.0
 
-K3S_VERSION=v1.25.3+k3s1
-KUBEVIRT_VERSION=v0.58.0
-LONGHORN_VERSION=v1.4.0
+K3S_VERSION=v1.26.3+k3s1
+KUBEVIRT_VERSION=v0.59.0
+LONGHORN_VERSION=v1.4.1
 
 INSTALL_LOG=/var/log/install.log
 # Check if k3s is already installed.
@@ -33,8 +33,10 @@ fi
 modprobe tun                                                        
 modprobe vhost_net    
 modprobe fuse         
-/etc/init.d/iscsid start
+modprobe iscsi_tcp
+/usr/sbin/iscsid start
 mount --make-rshared /
+setup_cgroup                                                   
 
 while true;
 do         
@@ -43,16 +45,15 @@ if [ ! -d /var/lib/longhorn ]; then
         if [ $network_available = "false" ]; then
                 echo "Waiting for network connectivity" >> $INSTALL_LOG
         else                                                           
-		setup_cgroup                                                   
 		echo "Installing K3S version $K3S_VERSION" >> $INSTALL_LOG
 		nohup /usr/bin/k3s server  --cluster-init --log=/var/log/k3s.log  &                                
 		sleep 30 
-		echo "Installing Kubevirt version $KUBEVIRT_VERSION" >> $INSTALL_LOG                                       
-		kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
-		kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml      
+		echo "Skipping Installing Kubevirt version $KUBEVIRT_VERSION" >> $INSTALL_LOG                                       
+		#kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
+		#kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml      
 		
-		echo "Installing longhorn version $LONGHORN_VERSION" >> $INSTALL_LOG                                       
-                kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/deploy/longhorn.yaml
+		echo "SKipping Installing longhorn version $LONGHORN_VERSION" >> $INSTALL_LOG                                       
+                #kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/deploy/longhorn.yaml
                 
         fi                                                                                                                
 else                                                                                                                      

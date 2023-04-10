@@ -13,11 +13,10 @@ config:
     - /config:/config
     - /:/hostfs
     - /persist:/persist:rshared,rbind
-    - /usr/bin/containerd:/usr/bin/containerd
     - /sys/fs/cgroup:/sys/fs/cgroup
   net: host
   capabilities:
-    - all
+    - all 
   pid: host
   rootfsPropagation: shared
   devices:
