@@ -47,14 +47,15 @@ if [ ! -d /var/lib/longhorn ]; then
         else                                                           
 		echo "Installing K3S version $K3S_VERSION" >> $INSTALL_LOG
 		nohup /usr/bin/k3s server  --cluster-init --log=/var/log/k3s.log  &                                
-		sleep 30 
-		echo "Skipping Installing Kubevirt version $KUBEVIRT_VERSION" >> $INSTALL_LOG                                       
-		#kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-operator.yaml
-		#kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml      
+                # A lame way for doing things, but ok for now
+		sleep 60 
+		echo "Installing patched Kubevirt" >> $INSTALL_LOG                                       
+		kubectl apply -f /etc/kubevirt-operator.yaml 
+                echo "Installing Kubevirt CR version $KUBEVIRT_VERSION" >> $INSTALL_LOG 
+		kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml      
 		
-		echo "SKipping Installing longhorn version $LONGHORN_VERSION" >> $INSTALL_LOG                                       
-                #kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/deploy/longhorn.yaml
-                
+		echo "Installing patched longhorn" >> $INSTALL_LOG                                       
+                kubectl apply -f /etc/longhorn-config.yaml 
         fi                                                                                                                
 else                                                                                                                      
 	ps -ef | grep "k3s server" | grep -v "grep" >> $INSTALL_LOG 

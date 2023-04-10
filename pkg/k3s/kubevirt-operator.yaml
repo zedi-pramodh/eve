@@ -98,16 +98,6 @@ spec:
               configuration:
                 description: holds kubevirt configurations. same as the virt-configMap
                 properties:
-                  additionalGuestMemoryOverheadRatio:
-                    description: AdditionalGuestMemoryOverheadRatio can be used to
-                      increase the virtualization infrastructure overhead. This is
-                      useful, since the calculation of this overhead is not accurate
-                      and cannot be entirely known in advance. The ratio that is being
-                      set determines by which factor to increase the overhead calculated
-                      by Kubevirt. A higher ratio means that the VMs would be less
-                      compromised by node pressures, but would mean that fewer VMs
-                      could be scheduled to a node. If not set, the default is 1.
-                    type: string
                   apiConfiguration:
                     description: ReloadableComponentConfiguration holds all generic
                       k8s configuration options which can be reloaded by components
@@ -2860,16 +2850,6 @@ spec:
               configuration:
                 description: holds kubevirt configurations. same as the virt-configMap
                 properties:
-                  additionalGuestMemoryOverheadRatio:
-                    description: AdditionalGuestMemoryOverheadRatio can be used to
-                      increase the virtualization infrastructure overhead. This is
-                      useful, since the calculation of this overhead is not accurate
-                      and cannot be entirely known in advance. The ratio that is being
-                      set determines by which factor to increase the overhead calculated
-                      by Kubevirt. A higher ratio means that the VMs would be less
-                      compromised by node pressures, but would mean that fewer VMs
-                      could be scheduled to a node. If not set, the default is 1.
-                    type: string
                   apiConfiguration:
                     description: ReloadableComponentConfiguration holds all generic
                       k8s configuration options which can be reloaded by components
@@ -5600,15 +5580,6 @@ metadata:
 rules:
 - apiGroups:
   - ""
-  resourceNames:
-  - kubevirt-ca
-  - kubevirt-export-ca
-  - kubevirt-virt-handler-certs
-  - kubevirt-virt-handler-server-certs
-  - kubevirt-operator-certs
-  - kubevirt-virt-api-certs
-  - kubevirt-controller-certs
-  - kubevirt-exportproxy-certs
   resources:
   - secrets
   verbs:
@@ -6138,7 +6109,6 @@ rules:
   - virtualmachineinstances/freeze
   - virtualmachineinstances/unfreeze
   - virtualmachineinstances/softreboot
-  - virtualmachineinstances/addinterface
   verbs:
   - update
 - apiGroups:
@@ -6377,7 +6347,6 @@ rules:
   - virtualmachineinstances/freeze
   - virtualmachineinstances/unfreeze
   - virtualmachineinstances/softreboot
-  - virtualmachineinstances/addinterface
   verbs:
   - update
 - apiGroups:
@@ -6397,7 +6366,6 @@ rules:
   - virtualmachines/removevolume
   - virtualmachines/migrate
   - virtualmachines/memorydump
-  - virtualmachines/addinterface
   verbs:
   - update
 - apiGroups:
@@ -6429,32 +6397,6 @@ rules:
   - virtualmachinesnapshots
   - virtualmachinesnapshotcontents
   - virtualmachinerestores
-  verbs:
-  - get
-  - delete
-  - create
-  - update
-  - patch
-  - list
-  - watch
-  - deletecollection
-- apiGroups:
-  - export.kubevirt.io
-  resources:
-  - virtualmachineexports
-  verbs:
-  - get
-  - delete
-  - create
-  - update
-  - patch
-  - list
-  - watch
-  - deletecollection
-- apiGroups:
-  - clone.kubevirt.io
-  resources:
-  - virtualmachineclones
   verbs:
   - get
   - delete
@@ -6523,7 +6465,6 @@ rules:
   - virtualmachineinstances/freeze
   - virtualmachineinstances/unfreeze
   - virtualmachineinstances/softreboot
-  - virtualmachineinstances/addinterface
   verbs:
   - update
 - apiGroups:
@@ -6543,7 +6484,6 @@ rules:
   - virtualmachines/removevolume
   - virtualmachines/migrate
   - virtualmachines/memorydump
-  - virtualmachines/addinterface
   verbs:
   - update
 - apiGroups:
@@ -6574,30 +6514,6 @@ rules:
   - virtualmachinesnapshots
   - virtualmachinesnapshotcontents
   - virtualmachinerestores
-  verbs:
-  - get
-  - delete
-  - create
-  - update
-  - patch
-  - list
-  - watch
-- apiGroups:
-  - export.kubevirt.io
-  resources:
-  - virtualmachineexports
-  verbs:
-  - get
-  - delete
-  - create
-  - update
-  - patch
-  - list
-  - watch
-- apiGroups:
-  - clone.kubevirt.io
-  resources:
-  - virtualmachineclones
   verbs:
   - get
   - delete
@@ -6681,22 +6597,6 @@ rules:
   - virtualmachinesnapshots
   - virtualmachinesnapshotcontents
   - virtualmachinerestores
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - export.kubevirt.io
-  resources:
-  - virtualmachineexports
-  verbs:
-  - get
-  - list
-  - watch
-- apiGroups:
-  - clone.kubevirt.io
-  resources:
-  - virtualmachineclones
   verbs:
   - get
   - list
@@ -6801,30 +6701,28 @@ spec:
         - virt-operator
         env:
         - name: VIRT_OPERATOR_IMAGE
-          value: index.docker.io/naimingshen/virt-operator@sha256:09e523e9ef06af09390141aecde93147a4bfd2426f314d9779531682a25634d0
+          value: index.docker.io/naimingshen/virt-operator@sha256:e7f278331951abf13ac72bd4f03a9f12cf5d417e262813de292ec204791c7bf1
         - name: WATCH_NAMESPACE
           valueFrom:
             fieldRef:
               fieldPath: metadata.annotations['olm.targetNamespaces']
         - name: VIRT_API_SHASUM
-          value: sha256:1dfc8de18e40f44a1499efa82eea7207846742a3d99ec5abdb2ef1f40f253069
+          value: sha256:6b31ccd0899c87a7a342b46ab9e58b2181e62d80a9b426e291e599a886505e2d
         - name: VIRT_CONTROLLER_SHASUM
-          value: sha256:6b9f3b029c22b6f3ed029849666006ba3bed8cdf28c17a2b76b3b071670c126f
+          value: sha256:318713dd2e4c06ea6839941f35c6dd61722c297094c4bb7c82ba436c51c58f41
         - name: VIRT_HANDLER_SHASUM
-          value: sha256:06e2327b14934736f497737c4cb11c2f9b6f1c629b96b5b8c3783c402d07148c
+          value: sha256:94421bd52a26e7e710efe4a93947b186d1e49c1cfd369fb3d1f5659143c6a0d2
         - name: VIRT_LAUNCHER_SHASUM
-          value: sha256:0a6d56f965de2d1752f10899d7f88abc2b38127692340e4484afeabf26560eea
+          value: sha256:016efeef7c469f86cf4d645f2f5a51e0f55afdd055b06063b0ee2e6b41f31ac6
         - name: VIRT_EXPORTPROXY_SHASUM
-          value: sha256:2993e74ecbb20240263b68c610bfd4b59d8f50a21e69470cfdcf9c2d6de41912
+          value: sha256:5c0c7fe78d644a4ec7c62b6f2612d35d8b00a9ec90d93ddb8f8cb14c830c2294
         - name: VIRT_EXPORTSERVER_SHASUM
-          value: sha256:2e8af92b80e31c686bc7098b486bfd1aa4954d5f0e50dedafcf171030e8fe953
+          value: sha256:fa39bcca005cdda441d48c683d9df7acb9bf4c6ba9180729c9fb7747e3cca64d
         - name: GS_SHASUM
-          value: sha256:cd24f6add0ed6885bd592fd38a7b0eed6aa415fd6c8fd2f4ccd1d8e847b235b1
-        - name: PR_HELPER_SHASUM
-          value: sha256:486bae5af3ed8fb0a56b04295ab6ff8afd94aa3024d9c88b7e075f23c4c997ce
+          value: sha256:2e73b01e07d8e613e31a51986890abd67fb4817979382b857e43475b621507fc
         - name: KUBEVIRT_VERSION
           value: latest
-        image: index.docker.io/naimingshen/virt-operator@sha256:09e523e9ef06af09390141aecde93147a4bfd2426f314d9779531682a25634d0
+        image: index.docker.io/naimingshen/virt-operator@sha256:e7f278331951abf13ac72bd4f03a9f12cf5d417e262813de292ec204791c7bf1
         imagePullPolicy: IfNotPresent
         name: virt-operator
         ports:
@@ -6844,7 +6742,7 @@ spec:
         resources:
           requests:
             cpu: 10m
-            memory: 450Mi
+            memory: 400Mi
         securityContext:
           allowPrivilegeEscalation: false
           capabilities:

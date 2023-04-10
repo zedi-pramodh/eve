@@ -3871,11 +3871,11 @@ spec:
     spec:
       initContainers:
       - name: wait-longhorn-admission-webhook
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         command: ['sh', '-c', 'while [ $(curl -m 1 -s -o /dev/null -w "%{http_code}" -k https://longhorn-admission-webhook:9443/v1/healthz) != "200" ]; do echo waiting; sleep 2; done']
       containers:
       - name: longhorn-manager
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         imagePullPolicy: IfNotPresent
         securityContext:
           privileged: true
@@ -3884,17 +3884,17 @@ spec:
         - -d
         - daemon
         - --engine-image
-        - "naimingshen/longhorn-engine:latest"
+        - "naimingshen/longhorn-engine:v1.4.1"
         - --instance-manager-image
-        - "naimingshen/longhorn-instance-manager:latest"
+        - "naimingshen/longhorn-instance-manager:v1.4.1"
         - --share-manager-image
-        - "naimingshen/longhorn-share-manager:latest"
+        - "naimingshen/longhorn-share-manager:v1.4.1"
         - --backing-image-manager-image
-        - "naimingshen/backing-image-manager:latest"
+        - "naimingshen/backing-image-manager:v1.4.1"
         - --support-bundle-manager-image
         - "longhornio/support-bundle-kit:v0.0.17"
         - --manager-image
-        - "naimingshen/longhorn-manager:latest"
+        - "naimingshen/longhorn-manager:v1.4.1"
         - --service-account
         - longhorn-service-account
         ports:
@@ -3970,18 +3970,18 @@ spec:
     spec:
       initContainers:
         - name: wait-longhorn-manager
-          image: naimingshen/longhorn-manager:latest
+          image: naimingshen/longhorn-manager:v1.4.1
           command: ['sh', '-c', 'while [ $(curl -m 1 -s -o /dev/null -w "%{http_code}" http://longhorn-backend:9500/v1) != "200" ]; do echo waiting; sleep 2; done']
       containers:
         - name: longhorn-driver-deployer
-          image: naimingshen/longhorn-manager:latest
+          image: naimingshen/longhorn-manager:v1.4.1
           imagePullPolicy: IfNotPresent
           command:
           - longhorn-manager
           - -d
           - deploy-driver
           - --manager-image
-          - "naimingshen/longhorn-manager:latest"
+          - "naimingshen/longhorn-manager:v1.4.1"
           - --manager-url
           - http://longhorn-backend:9500/v1
           env:
@@ -4051,7 +4051,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: longhorn-recovery-backend
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         imagePullPolicy: IfNotPresent
         securityContext:
           runAsUser: 2000
@@ -4180,7 +4180,7 @@ spec:
               topologyKey: kubernetes.io/hostname
       containers:
       - name: longhorn-conversion-webhook
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         imagePullPolicy: IfNotPresent
         securityContext:
           runAsUser: 2000
@@ -4240,14 +4240,14 @@ spec:
               topologyKey: kubernetes.io/hostname
       initContainers:
       - name: wait-longhorn-conversion-webhook
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         command: ['sh', '-c', 'while [ $(curl -m 1 -s -o /dev/null -w "%{http_code}" -k https://longhorn-conversion-webhook:9443/v1/healthz) != "200" ]; do echo waiting; sleep 2; done']
         imagePullPolicy: IfNotPresent
         securityContext:
           runAsUser: 2000
       containers:
       - name: longhorn-admission-webhook
-        image: naimingshen/longhorn-manager:latest
+        image: naimingshen/longhorn-manager:v1.4.1
         imagePullPolicy: IfNotPresent
         securityContext:
           runAsUser: 2000
