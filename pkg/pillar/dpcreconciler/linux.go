@@ -21,6 +21,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	"github.com/vishvananda/netlink"
 
+	node "github.com/lf-edge/eve/pkg/pillar/cmd/nodeagent"
 	generic "github.com/lf-edge/eve/pkg/pillar/dpcreconciler/genericitems"
 	linux "github.com/lf-edge/eve/pkg/pillar/dpcreconciler/linuxitems"
 	"github.com/lf-edge/eve/pkg/pillar/netmonitor"
@@ -170,6 +171,8 @@ type LinuxDpcReconciler struct {
 	prevArgs     Args
 	prevStatus   ReconcileStatus
 	radioSilence types.RadioSilence
+
+	kubeClusterMode bool
 }
 
 type pendingReconcile struct {
@@ -204,6 +207,7 @@ func (r *LinuxDpcReconciler) init() (startWatcher func()) {
 	if err != nil {
 		r.Log.Fatal(err)
 	}
+	r.kubeClusterMode = node.IsKubeCluster()
 	r.registry = registry
 	configurator := registry.GetConfigurator(generic.Wwan{})
 	r.wwanConfigurator = configurator.(*generic.WwanConfigurator)
@@ -887,7 +891,10 @@ func (r *LinuxDpcReconciler) getIntendedL3Cfg(dpc types.DevicePortConfig) dg.Gra
 	// with the api server. We may need to test out on if this affects the hari-pinning
 	// of Apps. On the other hand, if EVE Apps are kubernetes pods, they can communicate
 	// with each other by default.
-	//intendedL3.PutSubGraph(r.getIntendedSrcIPRules(dpc))
+	if !r.kubeClusterMode {
+		intendedL3.PutSubGraph(r.getIntendedSrcIPRules(dpc))
+	}
+
 	intendedL3.PutSubGraph(r.getIntendedRoutes(dpc))
 	intendedL3.PutSubGraph(r.getIntendedArps(dpc))
 	return intendedL3
