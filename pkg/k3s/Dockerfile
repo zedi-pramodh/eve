@@ -1,6 +1,6 @@
 # syntax=docker/dockerfile-upstream:1.5.0-rc2-labs
 
-FROM lfedge/eve-alpine:6db79cac4bacb88e31189721f02029305f032cae as build
+FROM lfedge/eve-alpine:c5fecbf55e75b10b48a6d4a504d2d9a2e3caf1f9 as build
 ENV PKGS alpine-baselayout musl-utils iproute2 iptables curl openrc \
 	open-iscsi libvirt libvirt-client util-linux grep
 RUN eve-alpine-deploy.sh

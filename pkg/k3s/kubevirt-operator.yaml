@@ -6707,13 +6707,13 @@ spec:
             fieldRef:
               fieldPath: metadata.annotations['olm.targetNamespaces']
         - name: VIRT_API_SHASUM
-          value: sha256:6b31ccd0899c87a7a342b46ab9e58b2181e62d80a9b426e291e599a886505e2d
+          value: sha256:fea6c7b990e114cf8e4dd8924bc71172a5a37e5ebaababb7eecffaee89116f21
         - name: VIRT_CONTROLLER_SHASUM
           value: sha256:318713dd2e4c06ea6839941f35c6dd61722c297094c4bb7c82ba436c51c58f41
         - name: VIRT_HANDLER_SHASUM
-          value: sha256:94421bd52a26e7e710efe4a93947b186d1e49c1cfd369fb3d1f5659143c6a0d2
+          value: sha256:1096e2a2f62512d037318d6b60cf70b5de2c4f255d127244c629854aa73ad8b8
         - name: VIRT_LAUNCHER_SHASUM
-          value: sha256:016efeef7c469f86cf4d645f2f5a51e0f55afdd055b06063b0ee2e6b41f31ac6
+          value: sha256:a739ccf0f25aa97c8c3f1d0b9c479e66efee444724867323a06aeee30245d6fe
         - name: VIRT_EXPORTPROXY_SHASUM
           value: sha256:5c0c7fe78d644a4ec7c62b6f2612d35d8b00a9ec90d93ddb8f8cb14c830c2294
         - name: VIRT_EXPORTSERVER_SHASUM
@@ -6721,7 +6721,7 @@ spec:
         - name: GS_SHASUM
           value: sha256:2e73b01e07d8e613e31a51986890abd67fb4817979382b857e43475b621507fc
         - name: KUBEVIRT_VERSION
-          value: latest
+          value: latest2
         image: index.docker.io/naimingshen/virt-operator@sha256:e7f278331951abf13ac72bd4f03a9f12cf5d417e262813de292ec204791c7bf1
         imagePullPolicy: IfNotPresent
         name: virt-operator
