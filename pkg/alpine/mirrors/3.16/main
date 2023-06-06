@@ -202,3 +202,10 @@ zlib-static
 zstd-dev
 zstd-libs
 zstd-static
+openrc
+open-iscsi
+pm-utils
+netcat-openbsd
+gnutls-utils
+boost1.78-dev
+parted 
