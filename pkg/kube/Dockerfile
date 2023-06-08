@@ -2,7 +2,7 @@
 
 FROM lfedge/eve-alpine:653bb41ad7d9a49d5ffed06353ca9b35a662b951 as build
 ENV PKGS alpine-baselayout musl-utils iproute2 iptables curl openrc \
-	open-iscsi libvirt libvirt-client util-linux grep
+         open-iscsi libvirt libvirt-client util-linux grep
 RUN eve-alpine-deploy.sh
 
 FROM scratch
