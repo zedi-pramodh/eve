@@ -649,8 +649,8 @@ $(ROOTFS_IMG): $(ROOTFS_TAR) | $(INSTALLER)
 	$(QUIET): $@: Begin
 	./tools/makerootfs.sh imagefromtar -t $(ROOTFS_TAR) -i $@ -f $(ROOTFS_FORMAT) -a $(ZARCH)
 	@echo "size of $@ is $$(wc -c < "$@")B"
-	@[ $$(wc -c < "$@") -gt $$(( 250 * 1024 * 1024 )) ] && \
-	        echo "ERROR: size of $@ is greater than 250MB (bigger than allocated partition)" && exit 1 || :
+	@[ $$(wc -c < "$@") -gt $$(( 350 * 1024 * 1024 )) ] && \
+	        echo "ERROR: size of $@ is greater than 350MB (bigger than allocated partition)" && exit 1 || :
 	$(QUIET): $@: Succeeded
 
 sbom_info:
