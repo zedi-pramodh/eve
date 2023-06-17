@@ -214,6 +214,9 @@ type zedagentContext struct {
 	fatalPtr    *bool
 	hangPtr     *bool
 
+	// kube cluster mode
+	hvTypeKube bool
+
 	// Netdump
 	netDumper            *netdump.NetDumper // nil if netdump is disabled
 	netdumpInterval      time.Duration
@@ -573,6 +576,8 @@ func (zedagentCtx *zedagentContext) init() {
 
 	attestCtx.zedagentCtx = zedagentCtx
 	zedagentCtx.attestCtx = attestCtx
+
+	zedagentCtx.hvTypeKube = base.IsHVTypeKube()
 }
 
 func initializeDirs() {
@@ -1322,9 +1327,13 @@ func initPostOnboardSubs(zedagentCtx *zedagentContext) {
 		log.Fatal(err)
 	}
 
+	domainMetricFrom := "domainmgr"
+	if zedagentCtx.hvTypeKube { // if in kubecluster mode, take DomainMetrics from zedkube
+		domainMetricFrom = "zedkube"
+	}
 	// Look for DomainMetric from domainmgr
 	getconfigCtx.subDomainMetric, err = ps.NewSubscription(pubsub.SubscriptionOptions{
-		AgentName:   "domainmgr",
+		AgentName:   domainMetricFrom,
 		MyAgentName: agentName,
 		TopicImpl:   types.DomainMetric{},
 		Activate:    true,
