@@ -53,6 +53,7 @@ type AppNetworkConfig struct {
 	CloudInitUserData   *string `json:"pubsub-large-CloudInitUserData"`
 	CipherBlockStatus   CipherBlockStatus
 	MetaDataType        MetaDataType
+	ULNetworkStatusList []UnderlayNetworkStatus // kubecluster mode need from zedkube
 }
 
 func (config AppNetworkConfig) Key() string {

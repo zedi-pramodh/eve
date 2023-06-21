@@ -1027,7 +1027,7 @@ func TestSingleLocalNI(test *testing.T) {
 	}, eth0Routes...))
 
 	// Connect application into the network instance.
-	appStatus, err := niReconciler.ConnectApp(ctx, app1NetConfig, app1Num, app1VIFs)
+	appStatus, err := niReconciler.ConnectApp(ctx, app1NetConfig, app1Num, app1VIFs, false)
 	t.Expect(err).ToNot(HaveOccurred())
 	t.Expect(appStatus.App).To(Equal(app1UUID.UUID))
 	t.Expect(appStatus.Deleted).To(BeFalse())
@@ -1258,7 +1258,7 @@ func TestIPv4LocalAndSwitchNIs(test *testing.T) {
 
 	// Connect application into network instances.
 	// VIFs on the switch NI will receive IPs later.
-	appStatus, err := niReconciler.ConnectApp(ctx, app2NetConfig, app2Num, app2VIFs)
+	appStatus, err := niReconciler.ConnectApp(ctx, app2NetConfig, app2Num, app2VIFs, false)
 	t.Expect(err).ToNot(HaveOccurred())
 	t.Expect(appStatus.App).To(Equal(app2UUID.UUID))
 	t.Expect(appStatus.Deleted).To(BeFalse())
@@ -1462,7 +1462,7 @@ func TestUplinkFailover(test *testing.T) {
 	networkMonitor.AddOrUpdateInterface(ni1BridgeIf)
 
 	// Connect application into the network instance.
-	_, err = niReconciler.ConnectApp(ctx, app1NetConfig, app1Num, app1VIFs)
+	_, err = niReconciler.ConnectApp(ctx, app1NetConfig, app1Num, app1VIFs, false)
 	t.Expect(err).ToNot(HaveOccurred())
 	t.Eventually(updatesCh).Should(Receive(&recUpdate))
 	t.Expect(recUpdate.UpdateType).To(Equal(nirec.AppConnReconcileStatusChanged))
@@ -1647,7 +1647,7 @@ func TestIPv6LocalAndSwitchNIs(test *testing.T) {
 
 	// Connect application into network instances.
 	// VIF on the switch NI will receive IPv6 address later.
-	appStatus, err := niReconciler.ConnectApp(ctx, app3NetConfig, app3Num, app3VIFs)
+	appStatus, err := niReconciler.ConnectApp(ctx, app3NetConfig, app3Num, app3VIFs, false)
 	t.Expect(err).ToNot(HaveOccurred())
 	t.Expect(appStatus.App).To(Equal(app3UUID.UUID))
 	t.Expect(appStatus.Deleted).To(BeFalse())
@@ -1888,7 +1888,7 @@ func TestAirGappedLocalAndSwitchNIs(test *testing.T) {
 		}))).To(BeFalse())
 
 	// Connect application into network instances.
-	appStatus, err := niReconciler.ConnectApp(ctx, app2NetConfig, app2Num, app2VIFs)
+	appStatus, err := niReconciler.ConnectApp(ctx, app2NetConfig, app2Num, app2VIFs, false)
 	t.Expect(err).ToNot(HaveOccurred())
 	t.Expect(appStatus.App).To(Equal(app2UUID.UUID))
 	t.Expect(appStatus.Deleted).To(BeFalse())
