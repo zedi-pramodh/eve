@@ -161,6 +161,7 @@ type AppInstanceConfig struct {
 	Snapshot SnapshotConfig
 	// XXX hack
 	KubeActivate bool
+	PodCreated   bool
 	ImageFqdn    string
 	ImageURL     string
 }
