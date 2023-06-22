@@ -104,7 +104,7 @@ func init() {
 	}
 
 	if base.IsHVTypeKube() {
-		defaultSnapshotter = "native"
+		defaultSnapshotter = "overlayfs"
 	}
 }
 
