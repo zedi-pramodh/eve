@@ -4,7 +4,6 @@
 package utils
 
 import (
-	"github.com/lf-edge/eve/pkg/pillar/base"
 	"strings"
 )
 
@@ -14,11 +13,6 @@ import (
 func MaybeInsertSha(name string, sha string) string {
 	if strings.Index(name, "@") != -1 {
 		// Already has a sha
-		return name
-	}
-
-	// Don't set sha in image name for k3s container managed images
-	if base.IsHVTypeKube() {
 		return name
 	}
 
