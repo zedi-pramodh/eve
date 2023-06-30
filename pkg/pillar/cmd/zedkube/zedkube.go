@@ -35,6 +35,7 @@ type zedkubeContext struct {
 	globalConfig             *types.ConfigItemValueMap
 	subNetworkInstanceStatus pubsub.Subscription
 	subAppInstanceConfig     pubsub.Subscription
+	subContentTreeStatus     pubsub.Subscription
 	pubNetworkInstanceStatus pubsub.Publication
 	pubAppNetworkConfig      pubsub.Publication
 	pubDomainMetric          pubsub.Publication
@@ -127,6 +128,25 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	zedkubeCtx.pubDomainMetric = pubDomainMetric
 
+	subContentTreeStatus, err := ps.NewSubscription(
+		pubsub.SubscriptionOptions{
+			AgentName:     "volumemgr",
+			MyAgentName:   agentName,
+			TopicImpl:     types.ContentTreeStatus{},
+			Activate:      false,
+			Ctx:           &zedkubeCtx,
+			CreateHandler: handleContentTreeStatusCreate,
+			ModifyHandler: handleContentTreeStatusModify,
+			DeleteHandler: handleContentTreeStatusDelete,
+			WarningTime:   warningTime,
+			ErrorTime:     errorTime,
+		})
+	if err != nil {
+		log.Fatal(err)
+	}
+	zedkubeCtx.subContentTreeStatus = subContentTreeStatus
+	subContentTreeStatus.Activate()
+
 	//zedkubeCtx.configWait = make(map[string]bool)
 	zedkubeCtx.appNetConfig = make(map[string]*types.AppNetworkConfig)
 
@@ -145,7 +165,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 				}
 			}
 			checkTimer = time.NewTimer(5 * time.Second)
+		case <-stillRunning.C:
 		}
+		ps.StillRunning(agentName, warningTime, errorTime)
 	}
 
 	client, err := kubernetes.NewForConfig(zedkubeCtx.config)
@@ -183,6 +205,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		case <-zedkubeCtx.appMetricsTimer.C:
 			publishAppMetrics(&zedkubeCtx)
 			zedkubeCtx.appMetricsTimer = time.NewTimer(10 * time.Second)
+
+		case change := <-zedkubeCtx.subContentTreeStatus.MsgChan():
+			zedkubeCtx.subContentTreeStatus.ProcessChange(change)
 
 		case <-stillRunning.C:
 		}
@@ -302,8 +327,9 @@ func handleAppInstanceConfigCreate(ctxArg interface{}, key string,
 	ctx := ctxArg.(*zedkubeContext)
 	config := configArg.(types.AppInstanceConfig)
 
-	log.Noticef("handleAppInstanceConfigCreate(%v) spec for %s, url %s",
-		config.UUIDandVersion, config.DisplayName, config.ImageURL)
+	log.Noticef("handleAppInstanceConfigCreate(%v) spec for %s, contentid %s",
+		config.UUIDandVersion, config.DisplayName, config.ContentID)
+
 	err := genAISpecCreate(ctx, &config)
 	log.Noticef("handleAppInstancConfigModify: genAISpec %v", err)
 }
@@ -313,8 +339,9 @@ func handleAppInstanceConfigModify(ctxArg interface{}, key string,
 	ctx := ctxArg.(*zedkubeContext)
 	config := configArg.(types.AppInstanceConfig)
 
-	log.Noticef("handleAppInstancConfigCreate(%v) spec for %s, url %s",
-		config.UUIDandVersion, config.DisplayName, config.ImageURL)
+	log.Noticef("handleAppInstancConfigCreate(%v) spec for %s, contentid %s",
+		config.UUIDandVersion, config.DisplayName, config.ContentID)
+
 	err := genAISpecCreate(ctx, &config)
 	log.Noticef("handleAppInstancConfigModify: genAISpec %v", err)
 }
@@ -336,4 +363,42 @@ func publishNetworkInstanceStatus(ctx *zedkubeContext,
 	ctx.networkInstanceStatusMap.Store(status.UUID, status)
 	pub := ctx.pubNetworkInstanceStatus
 	pub.Publish(status.Key(), *status)
+}
+
+func handleContentTreeStatusCreate(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	handleContentTreeStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleContentTreeStatusModify(ctxArg interface{}, key string,
+	statusArg interface{}, oldStatusArg interface{}) {
+	handleContentTreeStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleContentTreeStatusDelete(ctxArg interface{}, key string,
+	statusArg interface{}) {
+	// XXX comment out
+	//handleContentTreeStatusImpl(ctxArg, key, statusArg)
+}
+
+func handleContentTreeStatusImpl(ctxArg interface{}, key string,
+	statusArg interface{}) {
+
+	status := statusArg.(types.ContentTreeStatus)
+	ctx := ctxArg.(*zedkubeContext)
+	log.Functionf("handleContentTreeStatusImpl: key:%s, name:%s",
+		key, status.DisplayName)
+
+	if status.OciImageName != "" {
+		sub := ctx.subAppInstanceConfig
+		items := sub.GetAll()
+		for _, item := range items {
+			aiconfig := item.(types.AppInstanceConfig)
+			if aiconfig.ContentID == status.ContentID.String() {
+				log.Noticef("handleContentTreeStatusImpl: found aiconfig")
+				genAISpecCreate(ctx, &aiconfig)
+			}
+		}
+	}
+	log.Noticef("handleContentTreeStatusImpl done for %s", key)
 }
