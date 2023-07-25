@@ -16,6 +16,7 @@ require (
 	github.com/sirupsen/logrus v1.8.1
 	github.com/tatsushid/go-fastping v0.0.0-20160109021039-d7bb493dee3e
 	github.com/vishvananda/netlink v1.1.1-0.20210924202909-187053b97868
+	golang.org/x/crypto v0.0.0-20220525230936-793ad666bf5e
 	golang.org/x/sys v0.5.0
 )
 
