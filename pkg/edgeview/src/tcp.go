@@ -299,6 +299,10 @@ func setAndStartProxyTCP(opt string) {
 
 	var hasProxy, hasKube bool
 	var proxyDNSIP string
+	kubenum := edgeviewInstID - 1
+	if kubenum < 0 {
+		kubenum = 0
+	}
 	if strings.Contains(opt, "/") {
 		var gotProxy, gotKube bool
 		params := strings.Split(opt, "/")
@@ -315,7 +319,7 @@ func setAndStartProxyTCP(opt string) {
 				hasProxy = true
 			} else if gotKube {
 				hasKube = true
-				kubeport = 9001 + i + (edgeviewInstID-1)*types.EdgeviewMaxInstNum
+				kubeport = 9001 + i + kubenum*types.EdgeviewMaxInstNum
 				ipAddrPort[i] = tcpKubeEndpoint
 			}
 			log.Tracef("setAndStartProxyTCP: (%d) ipport %s", i, ipport)
@@ -329,7 +333,7 @@ func setAndStartProxyTCP(opt string) {
 		ipAddrPort[0] = opt
 		if hasKube {
 			ipAddrPort[0] = tcpKubeEndpoint
-			kubeport = 9001 + (edgeviewInstID-1)*types.EdgeviewMaxInstNum
+			kubeport = 9001 + kubenum*types.EdgeviewMaxInstNum
 		} else {
 			ipAddrPort[0] = opt
 		}
