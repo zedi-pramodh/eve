@@ -38,9 +38,9 @@ symmetricEncFile="/tmp/download/kube-config-yaml"
 encryptedSymKey=$(cat "$symmetricKeyEncFile")
 
 # Decrypt the symmetric key using the SSH private key
-symmetricKey=$(openssl rsautl -decrypt -inkey "$privateKeyFile" -in "$symmetricKeyEncFile")
+symmetricKey=$(openssl pkeyutl -decrypt -inkey "$privateKeyFile" -in "$symmetricKeyEncFile")
 
 # decrypt the kube config with openssl
-kconfig=$(openssl enc -aes-256-cbc -d -in "$symmetricEncFile" -k "$symmetricKey")
+kconfig=$(openssl enc -aes-256-cbc -d -in "$symmetricEncFile" -k "$symmetricKey" 2>/dev/null)
 
 echo "$kconfig"
