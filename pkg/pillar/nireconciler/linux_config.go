@@ -519,6 +519,7 @@ func (r *LinuxNIReconciler) getIntendedBlackholeCfg() dg.Graph {
 	// interface using a high-priority IP rule, packets which are only bridged
 	// and not routed by EVE escape this IP rule and would otherwise continue
 	// in their path even if marked for dropping.
+	/* XXX
 	dropMark := fmt.Sprintf("%d/%d", iptables.AceDropAction, iptables.AceActionMask)
 	intendedBlackholeCfg.PutItem(iptables.Rule{
 		RuleLabel: "Drop blackholed traffic",
@@ -543,6 +544,7 @@ func (r *LinuxNIReconciler) getIntendedBlackholeCfg() dg.Graph {
 			}, nil)
 		}
 	}
+	*/
 	return intendedBlackholeCfg
 }
 
