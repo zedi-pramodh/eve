@@ -8,12 +8,18 @@ package kubeapi
 import (
 	"bytes"
 	"compress/gzip"
+	"context"
+	"fmt"
 	"io"
 	"os"
 	"path/filepath"
 
 	"github.com/lf-edge/eve/pkg/pillar/types"
 	utils "github.com/lf-edge/eve/pkg/pillar/utils/file"
+
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/runtime/schema"
+	"k8s.io/client-go/dynamic"
 )
 
 //
@@ -56,4 +62,30 @@ func RegistrationExists(rootPath string) (bool, error) {
 		return true, nil
 	}
 	return false, err
+}
+
+// registrationAppliedToCluster returns nil if the AddOn has been applied
+// to the cluster
+func registrationAppliedToCluster() error {
+	config, err := GetKubeConfig()
+	if err != nil {
+		return fmt.Errorf("Failed to create dynamic client: %v", err)
+	}
+
+	dyn, err := dynamic.NewForConfig(config)
+	if err != nil {
+		return fmt.Errorf("Failed to create dynamic client: %v", err)
+	}
+
+	addonGVR := schema.GroupVersionResource{
+		Group:    "k3s.cattle.io",
+		Version:  "v1",
+		Resource: "addons",
+	}
+
+	addon, err := dyn.Resource(addonGVR).Get(context.TODO(), "persist-registration", metav1.GetOptions{})
+	if (err != nil) || (addon == nil) {
+		return fmt.Errorf("Failed to get AddOn/persist-registration: %v", err)
+	}
+	return nil
 }

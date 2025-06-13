@@ -31,7 +31,7 @@ Longhorn_uninstall() {
     done
     logmsg "longhorn_uninstall job wait begun"
 
-    # A clean, unbusy system can take ~1 min, allow for some delay
+    # A clean idle system can take ~1 min, allow for some delay
     i=1
     while [ $i -lt 1000 ]; do
         success=$(kubectl get job/longhorn-uninstall -n longhorn-system -o jsonpath='{.status.succeeded}')
@@ -50,7 +50,6 @@ Longhorn_uninstall() {
 
     kubectl delete -f https://raw.githubusercontent.com/longhorn/longhorn/${LONGHORN_VERSION}/uninstall/uninstall.yaml
     logmsg "longhorn_uninstall job deletion"
-    
     rm /var/lib/longhorn_initialized
     return 0
 }
