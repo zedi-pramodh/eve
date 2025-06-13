@@ -22,6 +22,13 @@ Kubevirt_uninstall() {
     logmsg "Removing patched Kubevirt"
     kubectl delete -f /etc/kubevirt-features.yaml
     kubectl delete -f /etc/kubevirt-operator.yaml
+
+    # Kubevirt applies a large amount of labels to nodes detailing available cpu flags, remove them
+    for n in $(kubectl get node -o NAME); do 
+        logmsg "removing kubevirt.io labels from node: $n"; 
+        labelsToRemove=$(kubectl get "$n" -o json | jq -r '.metadata.labels | to_entries[] | select(.key | contains("kubevirt.io")) | .key' | awk '{printf "%s- ", $0}')
+        kubectl label $n $labelsToRemove
+    done
     rm /var/lib/kubevirt_initialized
 }
 
