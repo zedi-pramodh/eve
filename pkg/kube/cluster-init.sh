@@ -611,6 +611,8 @@ monitor_cluster_config_change() {
 
 # started when we detect registration addition
 # start cleaning up some components
+# these are cluster-wide operations, only one nodes initates it
+# Marked via the Registration_Exists fence
 uninstall_components() {
         logmsg "Post-registration cleanup steps: wait api available"
         while ! kubectl cluster-info; do
@@ -618,7 +620,7 @@ uninstall_components() {
         done
         logmsg "Post-registration cleanup steps: kubectl cluster-info ready, wait nodes ready"
         while true; do
-                # shellcheck disable=SC2281,SC2154,SC2046
+                # shellcheck disable=SC2281,SC2154,SC2046,SC2016
                 $not_ready_nodes=$(kubectl get nodes -o go-template='{{range .items}}{{ $ready := false }}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{ $ready = true }}{{end}}{{end}}{{if not $ready}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}')
                 if [ "$not_ready_nodes" = "" ]; then
                         break
