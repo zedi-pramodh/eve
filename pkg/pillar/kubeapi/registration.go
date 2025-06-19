@@ -51,6 +51,10 @@ func RegistrationAdd(rootPath string, gzipYamlBody []byte) error {
 	if _, err := os.Stat(rootPath); err != nil {
 		os.MkdirAll(rootPath, 0700)
 	}
+	exists, err := RegistrationExists(rootPath)
+	if exists {
+		os.Remove(filepath.Join(rootPath, registrationFileName))
+	}
 	//return WriteAndRename(registrationFileName, rootPath, yamlBody)
 	return utils.WriteRename(filepath.Join(rootPath, registrationFileName), yamlBody)
 }
