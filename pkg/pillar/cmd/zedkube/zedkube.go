@@ -176,7 +176,8 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	log = logArg
 
 	zedkubeCtx := zedkube{
-		globalConfig: types.DefaultConfigItemValueMap(),
+		globalConfig:                       types.DefaultConfigItemValueMap(),
+		drainSkipK8sAPINotReachableTimeout: 300,
 	}
 
 	// do we run a single command, or long-running service?
