@@ -20,6 +20,7 @@ MAX_WAIT_TIME=$((10 * 60)) # 10 minutes in seconds, exponential backoff for k3s 
 current_wait_time=$INITIAL_WAIT_TIME
 CLUSTER_WAIT_FILE="/run/kube/cluster-change-wait-ongoing"
 All_PODS_READY=true
+WAIT_FOR_CLUSTER_TRANSITION=false
 install_kubevirt=1
 
 # shellcheck source=pkg/kube/descheduler-utils.sh
@@ -207,6 +208,15 @@ config_cluster_roles() {
 }
 
 check_start_k3s() {
+  # If cluster is in transition, wait until transition is complete
+  if [ "$WAIT_FOR_CLUSTER_TRANSITION" = "true" ]; then
+        logmsg "Cluster transition in progress, waiting before starting k3s"
+        while [ "$WAIT_FOR_CLUSTER_TRANSITION" = "true" ]; do
+                sleep 2
+        done
+        logmsg "Cluster transition completed, proceeding with k3s check"
+  fi
+
   # the cluster change code is in another task loop, so if the cluster wait is nogoing
   # don't go to start k3s in this time. wait also
   if [ -f "$CLUSTER_WAIT_FILE" ]; then
@@ -216,7 +226,7 @@ check_start_k3s() {
         done
   fi
 
-  pgrep -f "k3s server" > /dev/null 2>&1
+  pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
   if [ $? -eq 1 ]; then
         # do exponential backoff for k3s restart, but not more than MAX_WAIT_TIME
         RESTART_COUNT=$((RESTART_COUNT+1))
@@ -568,7 +578,9 @@ check_cluster_config_change() {
             # need to reapply node labels later
             rm /var/lib/node-labels-initialized
 
-            # kill the process and let the loop to restart k3s
+            # restart k3s will run only if we are ready after the transition configs set
+            WAIT_FOR_CLUSTER_TRANSITION=true
+
             terminate_k3s
             # romove the /var/lib/rancher/k3s/server/tls directory files
             if [ "$is_bootstrap" = "false" ]; then
@@ -580,7 +592,10 @@ check_cluster_config_change() {
             logmsg "provision config file for node to cluster mode"
             provision_cluster_config_file true
 
-            logmsg "WARNING: changing the node to cluster mode, done"
+            logmsg "WARNING: changing the node to cluster mode, k3s can restart"
+
+            ## Allow the k3s loop to restart k3s
+            WAIT_FOR_CLUSTER_TRANSITION=false
             break
           else
             sleep 10
@@ -819,6 +834,7 @@ while true;
 do
 if [ ! -f /var/lib/all_components_initialized ]; then
         if ! check_start_k3s; then
+                sleep 5  # Ensure minimum sleep time before retrying
                 continue
         fi
 
@@ -939,7 +955,7 @@ else
                     node_count_ready=$(kubectl get "node/${HOSTNAME}" | grep -cw Ready )
                     if [ "$node_count_ready" -ne 1 ]; then
                         sleep 10
-                        pgrep -f "k3s server" > /dev/null 2>&1
+                        pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
                         if [ $? -eq 1 ]; then
                             break
                         fi
