@@ -542,6 +542,12 @@ func (ctx kubevirtContext) Start(domainName string) error {
 	for {
 		_, err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Create(repvmi)
 		if err != nil {
+			if errors.IsAlreadyExists(err) {
+				// VMI could have been already started, for example failover from other node.
+				// Its not an error, just proceed.
+				logrus.Infof("Start VMI replicaset failed %v\n", err)
+				break
+			}
 			if strings.Contains(err.Error(), "dial tcp 127.0.0.1:6443") && i <= 0 {
 				logrus.Infof("Start VMI replicaset failed %v\n", err)
 				return err
