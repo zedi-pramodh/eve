@@ -6,7 +6,7 @@
 LOG_DIR=/persist/kubelog
 
 # This script is called from collect-info, help it avoid a timeout
-# by checking for longhorn installed state and return before applying 
+# by checking for longhorn installed state and return before applying
 # the support bundle manifest.
 if ! kubectl get namespace/longhorn-system; then
     echo "Longhorn not installed, skipping SupportBundle"

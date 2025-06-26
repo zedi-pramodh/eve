@@ -626,7 +626,7 @@ monitor_cluster_config_change() {
 
 # started when we detect registration addition
 # start cleaning up some components
-# these are cluster-wide operations, only one nodes initates it
+# these are cluster-wide operations, only one nodes initiates it
 # Marked via the Registration_Exists fence
 uninstall_components() {
         logmsg "Post-registration cleanup steps: wait api available"
@@ -1020,7 +1020,7 @@ fi
         check_kubeconfig_yaml_files
         check_and_remove_excessive_k3s_logs
         check_and_run_vnc
-        if ! Registration_Exists; then
+        if ! Registration_Applied; then
                 # Upgrades declared via EVE baseOS updates
                 Update_CheckClusterComponents
                 Update_RunDeschedulerOnBoot
