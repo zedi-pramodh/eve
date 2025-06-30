@@ -356,6 +356,74 @@ func LonghornReplicaList(ownerNodeName string, longhornVolName string) (*lhv1bet
 	return replicas, nil
 }
 
+// longhornReplicaListDelete deletes replicas for a given longhorn volume which is hosted on a given kubernetes node
+func longhornReplicaListDelete(ownerNodeName string, longhornVolName string) error {
+	apiExists, err := longhornAPIExists()
+	if err != nil {
+		return err
+	}
+	if !apiExists {
+		return nil
+	}
+
+	config, err := GetKubeConfig()
+	if err != nil {
+		return err
+	}
+
+	lhClient, err := versioned.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	labelSelectors := []string{}
+	if ownerNodeName != "" {
+		labelSelectors = append(labelSelectors, "longhornnode="+ownerNodeName)
+	}
+	if longhornVolName != "" {
+		labelSelectors = append(labelSelectors, "longhornvolume="+longhornVolName)
+	}
+	gracePeriod := int64(0)
+	propagationPolicy := metav1.DeletePropagationBackground
+	err = lhClient.LonghornV1beta2().Replicas("longhorn-system").DeleteCollection(context.Background(), metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+		PropagationPolicy:  &propagationPolicy,
+	}, metav1.ListOptions{
+		LabelSelector: strings.Join(labelSelectors, ","),
+	})
+	return err
+}
+
+// longhornReplicaDelete deletes replicas for a given longhorn volume which is hosted on a given kubernetes node
+func longhornReplicaDelete(lhRepName string) error {
+	apiExists, err := longhornAPIExists()
+	if err != nil {
+		return err
+	}
+	if !apiExists {
+		return nil
+	}
+
+	config, err := GetKubeConfig()
+	if err != nil {
+		return err
+	}
+
+	lhClient, err := versioned.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	gracePeriod := int64(0)
+	propagationPolicy := metav1.DeletePropagationBackground
+	err = lhClient.LonghornV1beta2().Replicas("longhorn-system").Delete(context.Background(), lhRepName, metav1.DeleteOptions{
+		GracePeriodSeconds: &gracePeriod,
+		PropagationPolicy:  &propagationPolicy,
+	})
+
+	return err
+}
+
 // longhornAPIExists will check for longhorn components installed and set
 // a flag in this module to gate all API access.  In some configurations
 // it is possible that longhorn is not installed but this intended configuration
@@ -368,7 +436,7 @@ func longhornAPIExists() (bool, error) {
 		return false, err
 	}
 	// If the longhorn-system namespace exists then we should expect the longhorn api endpoint is available.
-	ns, err := cs.CoreV1().Namespaces().Get(context.Background(), longhornNamespace, metav1.GetOptions{})
+	ns, err := cs.CoreV1().Namespaces().Get(context.Background(), "longhorn-system", metav1.GetOptions{})
 	if err != nil {
 		return false, err
 	}

@@ -40,3 +40,7 @@ func GetNodeDrainStatus(pubsub.Subscription, *base.LogObject) *NodeDrainStatus {
 	// No need to query for inprogress operations, just a noop
 	return &NodeDrainStatus{Status: NOTSUPPORTED}
 }
+
+func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) error {
+	return nil
+}

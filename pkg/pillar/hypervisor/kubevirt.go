@@ -655,6 +655,7 @@ func StopReplicaVMI(kubeconfig *rest.Config, repVmiName string) error {
 		return err
 	}
 
+	logrus.Infof("Attempt to stop VMI:%s vmirs deleted", repVmiName)
 	// Stop the VMI ReplicaSet
 	err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Delete(repVmiName, &metav1.DeleteOptions{})
 	if errors.IsNotFound(err) {
