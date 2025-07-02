@@ -155,18 +155,33 @@ func (z *zedkube) checkAppsStatus() {
 		}
 		contName := base.GetAppKubeName(aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
 
+		//
+		// We're looking for two pods:
+		// 1. An existing copy of a VMs virt-launcher pod which is terminating
+		//  We use this as a starting anchor to find and detach persistent volumes
+		//  So that the app can complete failover
+		// 2. A new copy of a VMs virt-launcher pod which is starting on a new node
+		//	We use this to fill in the ENClusterAppStatus above and tell the controller
+		//	Where the app is moved to.
+		//
+		// Both Pods will be of the pattern <appname>-<uuid prefix>-<pod uuid suffix>
+		terminatingVirtLauncherPod := ""
+
 		for _, pod := range pods.Items {
 			contVMIName := "virt-launcher-" + contName
-			log.Functionf("checkAppsStatus: pod %s, cont %s", pod.Name, contName)
+			log.Noticef("checkAppsStatus: pod %s, looking for cont %s", pod.Name, contName)
 			foundVMIPod := strings.HasPrefix(pod.Name, contVMIName)
 			if strings.HasPrefix(pod.Name, contName) || foundVMIPod {
+				// Case 1
 				if isPodTerminating(pod) {
 					// This is the old copy on the failed node, ignore it.
 					// Next in the list should be a new copy in 'Scheduling'
-					log.Noticef("Pod:%s is terminating onNode:%s deletionTime:%v",
-						pod.Name, pod.Spec.NodeName, pod.ObjectMeta.DeletionTimestamp)
-					continue
+					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is terminating onNode:%s deletionTime:%v",
+						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName, pod.ObjectMeta.DeletionTimestamp)
+					terminatingVirtLauncherPod = pod.Name
 				}
+
+				// Case 2
 				if pod.Spec.NodeName == z.nodeName {
 					encAppStatus.ScheduledOnThisNode = true
 				}
@@ -176,9 +191,10 @@ func (z *zedkube) checkAppsStatus() {
 				if foundVMIPod {
 					encAppStatus.AppIsVMI = true
 					encAppStatus.AppKubeName, _ = base.GetVMINameFromVirtLauncher(pod.Name)
+					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is attempting to start onNode:%s",
+						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName)
 				}
 				foundPod = true
-				break
 			}
 		}
 
@@ -189,9 +205,9 @@ func (z *zedkube) checkAppsStatus() {
 				break
 			}
 		}
-		log.Functionf("checkAppsStatus: devname %s, pod (%d) status %+v, old %+v", z.nodeName, len(pods.Items), encAppStatus, oldStatus)
+		log.Noticef("checkAppsStatus: devname %s, pod (%d) status %+v, old %+v", z.nodeName, len(pods.Items), encAppStatus, oldStatus)
 
-		// If this is first time after zedkube started (oldstatus is nil) and I am DNid and the app is not shceduled
+		// If this is first time after zedkube started (oldstatus is nil) and I am DNid and the app is not scheduled
 		// on this node. This condition is seen for two reasons
 		// 1) We just got appinstanceconfig and domainmgr did not get chance to start it yet, timing issue, zedkube checked first
 		// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
@@ -203,7 +219,7 @@ func (z *zedkube) checkAppsStatus() {
 
 		// Publish if there is a status change
 		if oldStatus == nil || oldStatus.ScheduledOnThisNode != encAppStatus.ScheduledOnThisNode || oldStatus.StatusRunning != encAppStatus.StatusRunning {
-			log.Functionf("checkAppsStatus: status differ, publish")
+			log.Noticef("checkAppsStatus: aiDisplayName:%s aiUUID:%s status differ, publish", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
 			// If app scheduled on this node, could happen for 3 reasons.
 			// 1) I am designated node.
 			// 2) I am not designated node but failover happened.
@@ -214,6 +230,8 @@ func (z *zedkube) checkAppsStatus() {
 			// Basically if app is scheduled on this node, no other node should have volumeattachments.
 			// This is our fencing mechanism.
 			if encAppStatus.ScheduledOnThisNode {
+				go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
+
 				for _, vol := range aiconfig.VolumeRefConfigList {
 					pvcName := fmt.Sprintf("%s-pvc-%d", vol.VolumeID.String(), vol.GenerationCounter)
 					// Get the PV name for this PVC

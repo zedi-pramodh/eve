@@ -16,6 +16,7 @@ import (
 	netclientset "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned"
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
+	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -398,4 +399,177 @@ func CleanupStaleVMI() (int, error) {
 		count++
 	}
 	return count, nil
+}
+
+// detachOldWorkload is used when EVE detects a node is no longer reachable and was running a VM app instance
+// This function will find the storage attached to that workload and detach it so that the VM app instance
+// can be started on a remaining ready node.
+// Caller is required to detect the VM app instances which
+func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
+	if log == nil {
+		return
+	}
+	if virtLauncherPodName == "" {
+		log.Errorf("DetachOldWorkload: a virt-launcher pod name is required!")
+	}
+
+	config, err := GetKubeConfig()
+	if err != nil {
+		log.Errorf("DetachOldWorkload: can't get kubeconfig %v", err)
+		return
+	}
+
+	clientset, err := kubernetes.NewForConfig(config)
+	if err != nil {
+		log.Errorf("DetachOldWorkload: can't get clientset %v", err)
+		return
+	}
+
+	//
+	// Collect info before we start cleanup
+	//
+
+	// Get host name pod is on
+	vlPod, err := clientset.CoreV1().Pods(EVEKubeNameSpace).Get(context.Background(), virtLauncherPodName, metav1.GetOptions{})
+	if (err != nil) || (vlPod == nil) {
+		log.Errorf("DetachOldWorkload: can't get pod:%s object err:%v", virtLauncherPodName, err)
+		return
+	}
+	kubernetesHostName := vlPod.Spec.NodeName
+
+	// Get VMI name, the vm.kubevirt.io/name label value
+	vmiName, vmiNameLabelExists := vlPod.ObjectMeta.Labels["vm.kubevirt.io/name"]
+	if !vmiNameLabelExists {
+		log.Errorf("DetachOldWorkload: virt-launcher pod:%s is missing vmi name label", virtLauncherPodName)
+		return
+	}
+
+	// Ensure VMI is terminating
+	kvClientset, err := kubecli.GetKubevirtClientFromRESTConfig(config)
+	if err != nil {
+		log.Errorf("DetachOldWorkload couldn't get the Kube client Config: %v", err)
+		return
+	}
+	ctx := context.Background()
+
+	vmiTerminatingWaitTry := 0
+	maxVmiTerminatingWaitTries := 100
+	for vmiTerminatingWaitTry < maxVmiTerminatingWaitTries {
+		vmiTerminatingWaitTry++
+		time.Sleep(30)
+		// get a list of our VMs
+		vmi, err := kvClientset.VirtualMachineInstance(EVEKubeNameSpace).Get(ctx, vmiName, &metav1.GetOptions{})
+		if err != nil {
+			log.Errorf("DetachOldWorkload couldn't get the Kubevirt VMI:%s for pod:%s err:%v", vmiName, virtLauncherPodName, err)
+			continue
+		}
+		// Exit if not terminating
+		if vmi.ObjectMeta.DeletionTimestamp == nil {
+			log.Noticef("DetachOldWorkload Can't Detach yet, waiting for terminating vmi:%s try:%d", vmiName, vmiTerminatingWaitTry)
+		}
+		if vmi.ObjectMeta.DeletionTimestamp != nil {
+			break
+		}
+	}
+
+	// Get longhorn vol names in pod
+	lhVolNames := []string{}
+	for _, vol := range vlPod.Spec.Volumes {
+		if vol.PersistentVolumeClaim == nil {
+			continue
+		}
+		pvcName := vol.PersistentVolumeClaim.ClaimName
+
+		pvc, err := clientset.CoreV1().PersistentVolumeClaims(EVEKubeNameSpace).Get(context.Background(), pvcName, metav1.GetOptions{})
+		if err != nil {
+			log.Errorf("DetachOldWorkload Can't get failed pod:%s PVC:%s err:%v", virtLauncherPodName, pvcName, err)
+			return
+		}
+		if pvc.ObjectMeta.Annotations["volume.kubernetes.io/storage-provisioner"] != "driver.longhorn.io" {
+			continue
+		}
+
+		lhVolName := pvc.Spec.VolumeName
+		lhVolNames = append(lhVolNames, lhVolName)
+	}
+
+	// Get longhorn-manager pod name on failed node
+	// "kubectl -n longhorn-system get pods -l app=longhorn-manager -o wide"
+	lhMgrPods, err := clientset.CoreV1().Pods("longhorn-system").List(context.Background(), metav1.ListOptions{
+		LabelSelector: "app=longhorn-manager",
+		FieldSelector: "spec.nodeName=" + kubernetesHostName,
+	})
+	if (err != nil) || (lhMgrPods == nil) {
+		log.Errorf("DetachOldWorkload Can't get failed longhorn-manager err:%v", err)
+		return
+	}
+	if len(lhMgrPods.Items) != 1 {
+		log.Errorf("DetachOldWorkload Invalid number of longhorn-manager pods")
+		return
+	}
+	lhMgrPodName := lhMgrPods.Items[0].ObjectMeta.Name
+
+	// Get replicas for vol name
+	var replicaNames []string
+	var allReps []*lhv1beta2.ReplicaList
+	for _, lhVolName := range lhVolNames {
+		lhVolReps, err := LonghornReplicaList(kubernetesHostName, lhVolName)
+		if err != nil {
+			log.Errorf("DetachOldWorkload Can't get failed replicas err:%v", err)
+			return
+		}
+		allReps = append(allReps, lhVolReps)
+		for _, replica := range lhVolReps.Items {
+			replicaNames = append(replicaNames, replica.ObjectMeta.Name)
+		}
+	}
+
+	//
+	// Log Actions before taking them, one searchable log string
+	//
+	detachLogRecipe := "DetachOldWorkload Cluster Detach volume from VM pod:%s on host:%s using replicas:%s"
+	log.Noticef(detachLogRecipe, virtLauncherPodName, kubernetesHostName, strings.Join(replicaNames, ","))
+
+	//
+	// Start Cleanup
+	//
+
+	log.Noticef("DetachOldWorkload Deleting virt-launcher pod:%s", virtLauncherPodName)
+	// Delete virt-launcher pod on failed node
+	gracePeriod := int64(0)
+	propagationPolicy := metav1.DeletePropagationBackground
+	err = clientset.CoreV1().Pods(EVEKubeNameSpace).Delete(context.Background(), virtLauncherPodName,
+		metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+			PropagationPolicy:  &propagationPolicy,
+		})
+	if err != nil {
+		log.Errorf("DetachOldWorkload Can't delete terminating virt-launcher pod:%s err:%v", virtLauncherPodName, err)
+		return
+	}
+
+	log.Noticef("DetachOldWorkload Deleting longhorn-system pod:%s", lhMgrPodName)
+	// Delete longhorn-manager pod on failed node
+	err = clientset.CoreV1().Pods("longhorn-system").Delete(context.Background(), lhMgrPodName,
+		metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+			PropagationPolicy:  &propagationPolicy,
+		})
+	if err != nil {
+		log.Errorf("DetachOldWorkload Can't delete failed longhorn-manager pod:%s err:%v", lhMgrPodName, err)
+		return
+	}
+
+	// Delete replica for PVC on failed node
+	for _, repList := range allReps {
+		for _, replica := range repList.Items {
+			log.Noticef("DetachOldWorkload Deleting replica:%s", replica.ObjectMeta.Name)
+			if err := longhornReplicaDelete(replica.ObjectMeta.Name); err != nil {
+				log.Errorf("DetachOldWorkload Can't delete failed replica:%s err:%v", replica.ObjectMeta.Name, err)
+			}
+		}
+	}
+
+	log.Noticef("DetachOldWorkload Completed failover for pod:%s", virtLauncherPodName)
+	return
 }
