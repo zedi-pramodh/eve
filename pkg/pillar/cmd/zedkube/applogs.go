@@ -179,6 +179,8 @@ func (z *zedkube) checkAppsStatus() {
 					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is terminating onNode:%s deletionTime:%v",
 						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName, pod.ObjectMeta.DeletionTimestamp)
 					terminatingVirtLauncherPod = pod.Name
+					go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
+					continue
 				}
 
 				// Case 2
@@ -230,7 +232,6 @@ func (z *zedkube) checkAppsStatus() {
 			// Basically if app is scheduled on this node, no other node should have volumeattachments.
 			// This is our fencing mechanism.
 			if encAppStatus.ScheduledOnThisNode {
-				go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
 
 				for _, vol := range aiconfig.VolumeRefConfigList {
 					pvcName := fmt.Sprintf("%s-pvc-%d", vol.VolumeID.String(), vol.GenerationCounter)
