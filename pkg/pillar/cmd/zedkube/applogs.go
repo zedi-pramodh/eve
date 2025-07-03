@@ -146,9 +146,7 @@ func (z *zedkube) checkAppsStatus() {
 
 	var oldStatus *types.ENClusterAppStatus
 	for _, item := range items {
-		var foundPod bool
 		aiconfig := item.(types.AppInstanceConfig)
-
 		encAppStatus := types.ENClusterAppStatus{
 			AppUUID:    aiconfig.UUIDandVersion.UUID,
 			IsDNidNode: aiconfig.IsDesignatedNodeID,
@@ -179,7 +177,6 @@ func (z *zedkube) checkAppsStatus() {
 					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is terminating onNode:%s deletionTime:%v",
 						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName, pod.ObjectMeta.DeletionTimestamp)
 					terminatingVirtLauncherPod = pod.Name
-					go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
 					continue
 				}
 
@@ -196,7 +193,6 @@ func (z *zedkube) checkAppsStatus() {
 					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is attempting to start onNode:%s",
 						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName)
 				}
-				foundPod = true
 			}
 		}
 
@@ -207,63 +203,37 @@ func (z *zedkube) checkAppsStatus() {
 				break
 			}
 		}
+
+		//
+		// We have a terminating virt-launcher pod, so a node is unreachable for some
+		// reason and a VMI failover needs to occur.  Set an interlock for only one detach
+		// and start detaching the PVC(s) from the VMI
+		//
+		if terminatingVirtLauncherPod == "" {
+			encAppStatus.DetachInProgress = false
+		} else {
+			// oldStatus may be nil for two reasons
+			// 1) We just got appinstanceconfig and domainmgr did not get chance to start it yet, timing issue, zedkube checked first
+			// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
+			if oldStatus == nil || !oldStatus.DetachInProgress {
+				encAppStatus.DetachInProgress = true
+				// This may take some time, don't hold up the main zedkube thread.
+				go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
+			}
+		}
+
 		log.Noticef("checkAppsStatus: devname %s, pod (%d) status %+v, old %+v", z.nodeName, len(pods.Items), encAppStatus, oldStatus)
 
 		// If this is first time after zedkube started (oldstatus is nil) and I am DNid and the app is not scheduled
 		// on this node. This condition is seen for two reasons
 		// 1) We just got appinstanceconfig and domainmgr did not get chance to start it yet, timing issue, zedkube checked first
 		// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
-
-		if oldStatus == nil && !encAppStatus.ScheduledOnThisNode && encAppStatus.IsDNidNode && !foundPod {
-			log.Noticef("checkAppsStatus: app not yet scheduled on this node %v", encAppStatus)
-			continue
-		}
-
-		// Publish if there is a status change
-		if oldStatus == nil || oldStatus.ScheduledOnThisNode != encAppStatus.ScheduledOnThisNode || oldStatus.StatusRunning != encAppStatus.StatusRunning {
+		if oldStatus == nil || !oldStatus.Equal(&encAppStatus) {
 			log.Noticef("checkAppsStatus: aiDisplayName:%s aiUUID:%s status differ, publish", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
 			// If app scheduled on this node, could happen for 3 reasons.
 			// 1) I am designated node.
 			// 2) I am not designated node but failover happened.
 			// 3) I am designated node but this is failback after failover.
-			// Get the list of volumes referenced by this app and delete the volume attachments from previous node.
-			// We need to do that because longhorn volumes are RWO and only one node can attach to those volumes.
-			// This will ensure at any given time only one node can write to those volumes, avoids corruptions.
-			// Basically if app is scheduled on this node, no other node should have volumeattachments.
-			// This is our fencing mechanism.
-			if encAppStatus.ScheduledOnThisNode {
-
-				for _, vol := range aiconfig.VolumeRefConfigList {
-					pvcName := fmt.Sprintf("%s-pvc-%d", vol.VolumeID.String(), vol.GenerationCounter)
-					// Get the PV name for this PVC
-					pv, err := kubeapi.GetPVFromPVC(pvcName, log)
-					if err != nil {
-						log.Errorf("Error getting PV from PVC %v", err)
-						continue
-					}
-
-					va, remoteNodeName, err := kubeapi.GetVolumeAttachmentFromPV(pv, log)
-					if err != nil {
-						log.Errorf("Error getting volumeattachment PV %s err %v", pv, err)
-						continue
-					}
-					// If no volumeattachment found, continue
-					if va == "" {
-						continue
-					}
-
-					// Delete the attachment if not on this node.
-					if remoteNodeName != z.nodeName {
-						log.Noticef("Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
-						err = kubeapi.DeleteVolumeAttachment(va, log)
-						if err != nil {
-							log.Errorf("Error deleting volumeattachment %s from PV %v", va, err)
-							continue
-						}
-					}
-
-				}
-			}
 			z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
 		}
 	}
