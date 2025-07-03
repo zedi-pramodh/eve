@@ -17,6 +17,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
 	"k8s.io/client-go/kubernetes"
@@ -437,6 +438,29 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 	}
 	kubernetesHostName := vlPod.Spec.NodeName
 
+	//
+	// Make sure the node is unreachable
+	//
+	node, err := clientset.CoreV1().Nodes().Get(context.Background(), kubernetesHostName, metav1.GetOptions{})
+	if (err != nil) || (node == nil) {
+		log.Errorf("DetachOldWorkload: can't get node:%s object err:%v", kubernetesHostName, err)
+		return
+	}
+	for _, condition := range node.Status.Conditions {
+		if condition.Type != "Ready" {
+			continue
+		}
+		// Found the ready condition
+		if condition.Status == "True" {
+			log.Errorf("DetachOldWorkload: returning due to node:%s health Ready", kubernetesHostName)
+			return
+		}
+
+		if condition.Message != "Kubelet stopped posting node status." {
+			log.Errorf("DetachOldWorkload: node:%s not reporting in", kubernetesHostName)
+		}
+	}
+
 	// Get VMI name, the vm.kubevirt.io/name label value
 	vmiName, vmiNameLabelExists := vlPod.ObjectMeta.Labels["vm.kubevirt.io/name"]
 	if !vmiNameLabelExists {
@@ -495,6 +519,7 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 
 	// Get longhorn-manager pod name on failed node
 	// "kubectl -n longhorn-system get pods -l app=longhorn-manager -o wide"
+	lhMgrPodName := ""
 	lhMgrPods, err := clientset.CoreV1().Pods("longhorn-system").List(context.Background(), metav1.ListOptions{
 		LabelSelector: "app=longhorn-manager",
 		FieldSelector: "spec.nodeName=" + kubernetesHostName,
@@ -503,11 +528,9 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		log.Errorf("DetachOldWorkload Can't get failed longhorn-manager err:%v", err)
 		return
 	}
-	if len(lhMgrPods.Items) != 1 {
-		log.Errorf("DetachOldWorkload Invalid number of longhorn-manager pods")
-		return
+	if len(lhMgrPods.Items) == 1 {
+		lhMgrPodName = lhMgrPods.Items[0].ObjectMeta.Name
 	}
-	lhMgrPodName := lhMgrPods.Items[0].ObjectMeta.Name
 
 	// Get replicas for vol name
 	var replicaNames []string
@@ -549,15 +572,19 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 	}
 
 	log.Noticef("DetachOldWorkload Deleting longhorn-system pod:%s", lhMgrPodName)
-	// Delete longhorn-manager pod on failed node
-	err = clientset.CoreV1().Pods("longhorn-system").Delete(context.Background(), lhMgrPodName,
-		metav1.DeleteOptions{
-			GracePeriodSeconds: &gracePeriod,
-			PropagationPolicy:  &propagationPolicy,
-		})
-	if err != nil {
-		log.Errorf("DetachOldWorkload Can't delete failed longhorn-manager pod:%s err:%v", lhMgrPodName, err)
-		return
+	// Delete longhorn-manager pod on failed node, only once if we're called for multiple VMIs
+	if lhMgrPodName != "" {
+		err = clientset.CoreV1().Pods("longhorn-system").Delete(context.Background(), lhMgrPodName,
+			metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+				PropagationPolicy:  &propagationPolicy,
+			})
+		if err != nil {
+			if !k8serrors.IsNotFound(err) {
+				log.Errorf("DetachOldWorkload Can't delete failed longhorn-manager pod:%s err:%v", lhMgrPodName, err)
+				return
+			}
+		}
 	}
 
 	// Delete replica for PVC on failed node
