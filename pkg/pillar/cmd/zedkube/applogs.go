@@ -259,7 +259,7 @@ func (z *zedkube) checkAppsStatus() {
 					}
 
 					// Delete the attachment if not on this node.
-					if remoteNodeName != ctx.nodeName {
+					if remoteNodeName != z.nodeName {
 						log.Noticef("Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
 						err = kubeapi.DeleteVolumeAttachment(va, log)
 						if err != nil {
