@@ -234,6 +234,43 @@ func (z *zedkube) checkAppsStatus() {
 			// 1) I am designated node.
 			// 2) I am not designated node but failover happened.
 			// 3) I am designated node but this is failback after failover.
+			// Get the list of volumes referenced by this app and delete the volume attachments from previous node.
+			// We need to do that becasue longhorn volumes are RWO and only one node can attach to those volumes.
+			// This will ensure at any given time only one node can write to those volumes, avoids corruptions.
+			// Basically if app is scheduled on this node, no other node should have volumeattachments.
+			if encAppStatus.ScheduledOnThisNode {
+				for _, vol := range aiconfig.VolumeRefConfigList {
+					pvcName := fmt.Sprintf("%s-pvc-%d", vol.VolumeID.String(), vol.GenerationCounter)
+					// Get the PV name for this PVC
+					pv, err := kubeapi.GetPVFromPVC(pvcName, log)
+					if err != nil {
+						log.Errorf("Error getting PV from PVC %v", err)
+						continue
+					}
+
+					va, remoteNodeName, err := kubeapi.GetVolumeAttachmentFromPV(pv, log)
+					if err != nil {
+						log.Errorf("Error getting volumeattachment PV %s err %v", pv, err)
+						continue
+					}
+					// If no volumeattachment found, continue
+					if va == "" {
+						continue
+					}
+
+					// Delete the attachment if not on this node.
+					if remoteNodeName != ctx.nodeName {
+						log.Noticef("Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
+						err = kubeapi.DeleteVolumeAttachment(va, log)
+						if err != nil {
+							log.Errorf("Error deleting volumeattachment %s from PV %v", va, err)
+							continue
+						}
+					}
+
+				}
+			}
+
 			z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
 		}
 	}
