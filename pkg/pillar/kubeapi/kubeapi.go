@@ -474,27 +474,6 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		log.Errorf("DetachOldWorkload couldn't get the Kube client Config: %v", err)
 		return
 	}
-	ctx := context.Background()
-
-	vmiTerminatingWaitTry := 0
-	maxVmiTerminatingWaitTries := 100
-	for vmiTerminatingWaitTry < maxVmiTerminatingWaitTries {
-		vmiTerminatingWaitTry++
-		time.Sleep(30)
-		// get a list of our VMs
-		vmi, err := kvClientset.VirtualMachineInstance(EVEKubeNameSpace).Get(ctx, vmiName, &metav1.GetOptions{})
-		if err != nil {
-			log.Errorf("DetachOldWorkload couldn't get the Kubevirt VMI:%s for pod:%s err:%v", vmiName, virtLauncherPodName, err)
-			continue
-		}
-		// Exit if not terminating
-		if vmi.ObjectMeta.DeletionTimestamp == nil {
-			log.Noticef("DetachOldWorkload Can't Detach yet, waiting for terminating vmi:%s try:%d", vmiName, vmiTerminatingWaitTry)
-		}
-		if vmi.ObjectMeta.DeletionTimestamp != nil {
-			break
-		}
-	}
 
 	// Get longhorn vol names in pod
 	lhVolNames := []string{}
@@ -571,6 +550,18 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		return
 	}
 
+	// Delete vmi
+	log.Noticef("DetachOldWorkload Deleting vmi:%s", vmiName)
+	err = kvClientset.VirtualMachineInstance(EVEKubeNameSpace).Delete(context.Background(), vmiName,
+		&metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+			PropagationPolicy:  &propagationPolicy,
+		})
+	if err != nil {
+		log.Errorf("DetachOldWorkload couldn't delete the Kubevirt VMI:%s for pod:%s err:%v", vmiName, virtLauncherPodName, err)
+		return
+	}
+
 	log.Noticef("DetachOldWorkload Deleting longhorn-system pod:%s", lhMgrPodName)
 	// Delete longhorn-manager pod on failed node, only once if we're called for multiple VMIs
 	if lhMgrPodName != "" {
@@ -593,6 +584,28 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 			log.Noticef("DetachOldWorkload Deleting replica:%s", replica.ObjectMeta.Name)
 			if err := longhornReplicaDelete(replica.ObjectMeta.Name); err != nil {
 				log.Errorf("DetachOldWorkload Can't delete failed replica:%s err:%v", replica.ObjectMeta.Name, err)
+			}
+		}
+	}
+
+	for _, lhVolName := range lhVolNames {
+		va, remoteNodeName, err := GetVolumeAttachmentFromPV(lhVolName, log)
+		if err != nil {
+			log.Errorf("DetachOldWorkload Error getting volumeattachment PV %s err %v", lhVolName, err)
+			continue
+		}
+		// If no volumeattachment found, continue
+		if va == "" {
+			continue
+		}
+
+		// Delete the attachment if not on this node.
+		if remoteNodeName == kubernetesHostName {
+			log.Noticef("DetachOldWorkload Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
+			err = DeleteVolumeAttachment(va, log)
+			if err != nil {
+				log.Errorf("DetachOldWorkload Error deleting volumeattachment %s from PV %v", va, err)
+				continue
 			}
 		}
 	}
