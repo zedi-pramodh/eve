@@ -19,9 +19,9 @@ func WaitForKubernetes(string, *pubsub.PubSub, *time.Ticker,
 	panic("WaitForKubernetes is not built")
 }
 
-// CleanupStaleVMI in this file is just stub for non-kubevirt hypervisors.
-func CleanupStaleVMI() (int, error) {
-	panic("CleanupStaleVMI is not built")
+// CleanupStaleVMIRs in this file is just stub for non-kubevirt hypervisors.
+func CleanupStaleVMIRs() (int, error) {
+	panic("CleanupStaleVMIRs is not built")
 }
 
 // GetPVCList in this file is just stub for non-kubevirt hypervisors.
