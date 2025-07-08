@@ -244,6 +244,19 @@ func (ctx kubevirtContext) Setup(status types.DomainStatus, config types.DomainC
 
 }
 
+func rebootInProgress() bool {
+	_, err := os.Stat(types.NodeRebootInProgressFile)
+
+	// Can be any error, including file not exists. If we see error return false.
+	if err != nil {
+		logError("Could not stat file %s err %v", types.NodeRebootInProgressFile, err)
+		return false
+
+	}
+
+	return true
+}
+
 // Kubevirt VMI ReplicaSet config spec is updated with the domain config/status of the app.
 // The details and the struct of the spec can be found at:
 // https://kubevirt.io/api-reference/v1.0.0/definitions.html
@@ -578,6 +591,13 @@ func (ctx kubevirtContext) Create(domainName string, cfgFilename string, config 
 // There is no such thing as stop VMI, so delete it.
 func (ctx kubevirtContext) Stop(domainName string, force bool) error {
 	logrus.Debugf("Stop called for Domain: %s", domainName)
+
+	// If this node is in a cluster and reboot in progress, do not stop app. It will failover to
+	// another node.
+	if rebootInProgress() && kubeapi.IsClusterMode() {
+		return nil
+	}
+
 	err := getConfig(&ctx)
 	if err != nil {
 		return err
@@ -609,6 +629,13 @@ func (ctx kubevirtContext) Stop(domainName string, force bool) error {
 
 func (ctx kubevirtContext) Delete(domainName string) (result error) {
 	logrus.Debugf("Delete called for Domain: %s", domainName)
+
+	// If this node is in a cluster and reboot in progress, do not delete app. It will failover to
+	// another node.
+	if rebootInProgress() && kubeapi.IsClusterMode() {
+		return nil
+	}
+
 	err := getConfig(&ctx)
 	if err != nil {
 		return err
@@ -671,6 +698,12 @@ func StopReplicaVMI(kubeconfig *rest.Config, repVmiName string) error {
 func (ctx kubevirtContext) Info(domainName string) (int, types.SwState, error) {
 
 	logrus.Debugf("Info called for Domain: %s", domainName)
+
+	// If this node is in cluster and rebooting, app will failover so just return unknown status
+	if rebootInProgress() && kubeapi.IsClusterMode() {
+		return 0, types.UNKNOWN, nil
+	}
+
 	nodeName, ok := ctx.nodeNameMap["nodename"]
 	if !ok {
 		return 0, types.BROKEN, logError("Failed to get nodeName")

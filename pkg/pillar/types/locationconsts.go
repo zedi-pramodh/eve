@@ -144,6 +144,9 @@ const (
 
 	// LocalActiveAppConfigDir - directory to put JSON of the apps that are running.
 	LocalActiveAppConfigDir = "/persist/vault/active-app-instance-config/"
+
+	// NodeRebootInProgressFile - A temp file to mark this device reboot is in progress
+	NodeRebootInProgressFile = "/run/node-reboot-inprogress"
 )
 
 var (

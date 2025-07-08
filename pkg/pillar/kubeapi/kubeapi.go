@@ -17,6 +17,7 @@ import (
 	"github.com/lf-edge/eve/pkg/pillar/base"
 	"github.com/lf-edge/eve/pkg/pillar/pubsub"
 	lhv1beta2 "github.com/longhorn/longhorn-manager/k8s/pkg/apis/longhorn/v1beta2"
+	"github.com/sirupsen/logrus"
 	k8serrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -636,20 +637,21 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 }
 
 // IsClusterMode : Returns true if this node is part of a cluster by checking EdgeNodeClusterConfigFile
-func IsClusterMode(log *base.LogObject) bool {
+func IsClusterMode() bool {
 
 	fileInfo, err := os.Stat(EdgeNodeClusterConfigFile)
 	if os.IsNotExist(err) {
-		log.Noticef("This node is not in cluster mode")
+		logrus.Infof("This node is not in cluster mode")
 		return false
 	} else if err != nil {
-		log.Errorf("Error checking file '%s': %v", EdgeNodeClusterConfigFile, err)
+		logrus.Errorf("Error checking file '%s': %v", EdgeNodeClusterConfigFile, err)
 		return false
 	}
 
 	if fileInfo.Size() > 0 {
-		log.Noticef("This node is in cluster mode")
+		logrus.Infof("This node is in cluster mode")
 		return true
 	}
+
 	return false
 }

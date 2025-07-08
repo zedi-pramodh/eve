@@ -652,7 +652,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			// the device is powered off. Next config refresh will see app is gone and domainmgr will not do anything.
 			// But kubernetes thinks app is still running and starts. So its safe to delete all replica sets at the start
 			// on single node installs.
-			cluster_mode := kubeapi.IsClusterMode(log)
+			cluster_mode := kubeapi.IsClusterMode()
 
 			if !cluster_mode {
 				count, err := kubeapi.CleanupStaleVMIRs()
