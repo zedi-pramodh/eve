@@ -215,7 +215,7 @@ func (z *zedkube) checkAppsStatus() {
 			// oldStatus may be nil for two reasons
 			// 1) We just got appinstanceconfig and domainmgr did not get chance to start it yet, timing issue, zedkube checked first
 			// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
-			if oldStatus == nil || !oldStatus.DetachInProgress {
+			if (oldStatus == nil || !oldStatus.DetachInProgress) && encAppStatus.ScheduledOnThisNode {
 				encAppStatus.DetachInProgress = true
 				// This may take some time, don't hold up the main zedkube thread.
 				go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
@@ -238,39 +238,6 @@ func (z *zedkube) checkAppsStatus() {
 			// We need to do that becasue longhorn volumes are RWO and only one node can attach to those volumes.
 			// This will ensure at any given time only one node can write to those volumes, avoids corruptions.
 			// Basically if app is scheduled on this node, no other node should have volumeattachments.
-			if encAppStatus.ScheduledOnThisNode {
-				for _, vol := range aiconfig.VolumeRefConfigList {
-					pvcName := fmt.Sprintf("%s-pvc-%d", vol.VolumeID.String(), vol.GenerationCounter)
-					// Get the PV name for this PVC
-					pv, err := kubeapi.GetPVFromPVC(pvcName, log)
-					if err != nil {
-						log.Errorf("Error getting PV from PVC %v", err)
-						continue
-					}
-
-					va, remoteNodeName, err := kubeapi.GetVolumeAttachmentFromPV(pv, log)
-					if err != nil {
-						log.Errorf("Error getting volumeattachment PV %s err %v", pv, err)
-						continue
-					}
-					// If no volumeattachment found, continue
-					if va == "" {
-						continue
-					}
-
-					// Delete the attachment if not on this node.
-					if remoteNodeName != z.nodeName {
-						log.Noticef("Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
-						err = kubeapi.DeleteVolumeAttachment(va, log)
-						if err != nil {
-							log.Errorf("Error deleting volumeattachment %s from PV %v", va, err)
-							continue
-						}
-					}
-
-				}
-			}
-
 			z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
 		}
 	}

@@ -383,7 +383,7 @@ func GetPVFromPVC(pvcName string, log *base.LogObject) (string, error) {
 // longhorn attaches to the PV to serve to the apps. This API returns the attachment name and nodename.
 // We use that attachment name to delete the attachment during failover.
 // Basically the attachment of previous node needs to be deleted to attach to current node.
-func GetVolumeAttachmentFromPV(volName string, log *base.LogObject) (string, string, error) {
+func GetVolumeAttachmentFromPV(volName string, nodeName string, log *base.LogObject) (string, string, error) {
 	// Get the Kubernetes clientset
 	clientset, err := GetClientSet()
 	if err != nil {
@@ -401,6 +401,9 @@ func GetVolumeAttachmentFromPV(volName string, log *base.LogObject) (string, str
 
 	// Iterate through VolumeAttachments to find one that references the PV's CSI volume handle
 	for _, va := range volumeAttachments.Items {
+		if va.Spec.NodeName != nodeName {
+			continue
+		}
 		if va.Spec.Source.PersistentVolumeName != nil && *va.Spec.Source.PersistentVolumeName == volName {
 			log.Noticef("VolumeAttachment for vol %s found: %s (attached to node: %s)\n", volName, va.Name, va.Spec.NodeName)
 			return va.Name, va.Spec.NodeName, nil
@@ -422,9 +425,10 @@ func DeleteVolumeAttachment(vaName string, log *base.LogObject) error {
 
 	// Force delete the VolumeAttachment with grace period set to 0
 	// This will ensure attachment is really deleted before its assigned to some other node.
+	gracePeriod := int64(0)
 	deletePolicy := metav1.DeletePropagationForeground
 	deleteOptions := metav1.DeleteOptions{
-		GracePeriodSeconds: new(int64), // Set grace period to 0 for force deletion
+		GracePeriodSeconds: &gracePeriod, // Set grace period to 0 for force deletion
 		PropagationPolicy:  &deletePolicy,
 	}
 
