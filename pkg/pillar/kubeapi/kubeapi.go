@@ -490,7 +490,20 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		return
 	}
 
-	// Ensure VMI is terminating
+	// Get virt-handler pod name on failed node
+	virtHandlerPodName := ""
+	pods, err := clientset.CoreV1().Pods("kubevirt").List(context.Background(), metav1.ListOptions{
+		FieldSelector: "spec.nodeName=" + kubernetesHostName,
+		LabelSelector: "kubevirt.io=virt-handler",
+	})
+	if err != nil {
+		log.Errorf("DetachOldWorkload unable to get virt-handler pod on node: %v", err)
+		return
+	}
+	if (pods != nil) && (len(pods.Items) == 1) {
+		virtHandlerPodName = pods.Items[0].ObjectMeta.Name
+	}
+
 	kvClientset, err := kubecli.GetKubevirtClientFromRESTConfig(config)
 	if err != nil {
 		log.Errorf("DetachOldWorkload couldn't get the Kube client Config: %v", err)
@@ -551,8 +564,8 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 	//
 	// Log Actions before taking them, one searchable log string
 	//
-	detachLogRecipe := "DetachOldWorkload Cluster Detach volume from VM pod:%s on host:%s using replicas:%s"
-	log.Noticef(detachLogRecipe, virtLauncherPodName, kubernetesHostName, strings.Join(replicaNames, ","))
+	detachLogRecipe := "DetachOldWorkload Cluster Detach volume from VM pod:%s vmi:%s host:%s lhMgrPod:%s virtHandlerPod:%s replicas:%s"
+	log.Noticef(detachLogRecipe, virtLauncherPodName, vmiName, kubernetesHostName, lhMgrPodName, virtHandlerPodName, strings.Join(replicaNames, ","))
 
 	//
 	// Start Cleanup
@@ -561,7 +574,7 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 	log.Noticef("DetachOldWorkload Deleting virt-launcher pod:%s", virtLauncherPodName)
 	// Delete virt-launcher pod on failed node
 	gracePeriod := int64(0)
-	propagationPolicy := metav1.DeletePropagationBackground
+	propagationPolicy := metav1.DeletePropagationForeground
 	err = clientset.CoreV1().Pods(EVEKubeNameSpace).Delete(context.Background(), virtLauncherPodName,
 		metav1.DeleteOptions{
 			GracePeriodSeconds: &gracePeriod,
@@ -584,9 +597,25 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		return
 	}
 
-	log.Noticef("DetachOldWorkload Deleting longhorn-system pod:%s", lhMgrPodName)
+	// Delete virt-handler pod on that node
+	if virtHandlerPodName != "" {
+		log.Noticef("DetachOldWorkload Deleting kubevirt virt-handler pod:%s", virtHandlerPodName)
+		err = clientset.CoreV1().Pods("kubevirt").Delete(context.Background(), virtHandlerPodName,
+			metav1.DeleteOptions{
+				GracePeriodSeconds: &gracePeriod,
+				PropagationPolicy:  &propagationPolicy,
+			})
+		if err != nil {
+			if !k8serrors.IsNotFound(err) {
+				log.Errorf("DetachOldWorkload Can't delete virt-handler pod:%s err:%v", virtHandlerPodName, err)
+				return
+			}
+		}
+	}
+
 	// Delete longhorn-manager pod on failed node, only once if we're called for multiple VMIs
 	if lhMgrPodName != "" {
+		log.Noticef("DetachOldWorkload Deleting longhorn-system pod:%s", lhMgrPodName)
 		err = clientset.CoreV1().Pods("longhorn-system").Delete(context.Background(), lhMgrPodName,
 			metav1.DeleteOptions{
 				GracePeriodSeconds: &gracePeriod,
@@ -611,7 +640,7 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 	}
 
 	for _, lhVolName := range lhVolNames {
-		va, remoteNodeName, err := GetVolumeAttachmentFromPV(lhVolName, log)
+		va, remoteNodeName, err := GetVolumeAttachmentFromPV(lhVolName, kubernetesHostName, log)
 		if err != nil {
 			log.Errorf("DetachOldWorkload Error getting volumeattachment PV %s err %v", lhVolName, err)
 			continue
@@ -622,13 +651,11 @@ func DetachOldWorkload(log *base.LogObject, virtLauncherPodName string) {
 		}
 
 		// Delete the attachment if not on this node.
-		if remoteNodeName == kubernetesHostName {
-			log.Noticef("DetachOldWorkload Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
-			err = DeleteVolumeAttachment(va, log)
-			if err != nil {
-				log.Errorf("DetachOldWorkload Error deleting volumeattachment %s from PV %v", va, err)
-				continue
-			}
+		log.Noticef("DetachOldWorkload Deleting volumeattachment %s on remote node %s", va, remoteNodeName)
+		err = DeleteVolumeAttachment(va, log)
+		if err != nil {
+			log.Errorf("DetachOldWorkload Error deleting volumeattachment %s from PV %v", va, err)
+			continue
 		}
 	}
 
