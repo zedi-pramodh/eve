@@ -29,7 +29,7 @@ import (
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
-	"k8s.io/apimachinery/pkg/api/errors"
+	kerrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
@@ -555,7 +555,7 @@ func (ctx kubevirtContext) Start(domainName string) error {
 	for {
 		_, err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Create(repvmi)
 		if err != nil {
-			if errors.IsAlreadyExists(err) {
+			if kerrors.IsAlreadyExists(err) {
 				// VMI could have been already started, for example failover from other node.
 				// Its not an error, just proceed.
 				logrus.Infof("Start VMI replicaset failed %v\n", err)
@@ -685,7 +685,7 @@ func StopReplicaVMI(kubeconfig *rest.Config, repVmiName string) error {
 	logrus.Infof("Attempt to stop VMI:%s vmirs deleted", repVmiName)
 	// Stop the VMI ReplicaSet
 	err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Delete(repVmiName, &metav1.DeleteOptions{})
-	if errors.IsNotFound(err) {
+	if kerrors.IsNotFound(err) {
 		logrus.Infof("Stop VMI Replicaset, Domain already deleted: %v", repVmiName)
 	} else {
 		logrus.Errorf("Stop VMI Replicaset error %v\n", err)
@@ -725,7 +725,7 @@ func (ctx kubevirtContext) Info(domainName string) (int, types.SwState, error) {
 		res, err = getVMIStatus(vmis, nodeName)
 	}
 	if err != nil {
-		if strings.Contains(err.Error(), "etcdserver: request timed out") || strings.Contains(err.Error(), "apiserver not ready") {
+		if isK3sUnreachable(err) {
 			return 0, types.UNKNOWN, nil
 		}
 		return 0, types.BROKEN, logError("domain %s failed to get info: %v", domainName, err)
@@ -814,7 +814,7 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 	vmiList, err := virtClient.VirtualMachineInstance(kubeapi.EVEKubeNameSpace).List(context.Background(), &metav1.ListOptions{})
 	if err != nil {
 
-		if strings.Contains(err.Error(), "etcdserver: request timed out") || strings.Contains(err.Error(), "apiserver not ready") {
+		if isK3sUnreachable(err) {
 			// This means we are unable to talk to kubernetes.
 			// May be API server crashed or network cable got pulled ??
 			return "Unknown", err
@@ -889,8 +889,8 @@ func waitForVMI(vmis *vmiMetaData, nodeName string, available bool) error {
 		}
 
 		if waited > maxDelay {
-			// Give up
-			logrus.Warnf("waitForVMIfor %s %t: giving up", vmiName, available)
+			// Give up, also log the state at the time of give up.
+			logrus.Warnf("waitForVMIfor %s %t: giving up at state : %s", vmiName, available, state)
 			if available {
 				return logError("VMI not found: error %v", err)
 			}
@@ -1327,7 +1327,7 @@ func StartReplicaPodContiner(ctx kubevirtContext, vmis *vmiMetaData) error {
 	opStr := "created"
 	result, err := clientset.AppsV1().ReplicaSets(kubeapi.EVEKubeNameSpace).Create(context.TODO(), rep, metav1.CreateOptions{})
 	if err != nil {
-		if !errors.IsAlreadyExists(err) {
+		if !kerrors.IsAlreadyExists(err) {
 			logrus.Errorf("StartReplicaPodContiner: replicaset create failed: %v", err)
 			return err
 		} else {
@@ -1803,4 +1803,13 @@ func checkAndReturnStatus(vmis *vmiMetaData, gotUnknown bool) (string, error) {
 		vmis.startUnknownTime = time.Time{}
 	}
 	return "", nil
+}
+
+// check if the error is due to k3s unreachable or any other timeouts.
+func isK3sUnreachable(err error) bool {
+
+	if kerrors.IsServerTimeout(err) || kerrors.IsTimeout(err) || kerrors.IsServiceUnavailable(err) {
+		return true
+	}
+	return false
 }
