@@ -528,11 +528,11 @@ func (ctx kubevirtContext) Start(domainName string) error {
 	}
 	kubeconfig := ctx.kubeConfig
 
-	logrus.Infof("Starting Kubevirt domain %s, devicename nodename %d", domainName, len(ctx.nodeNameMap))
 	vmis, ok := ctx.vmiList[domainName]
 	if !ok {
 		return logError("start domain %s failed to get vmlist", domainName)
 	}
+	logrus.Infof("Starting Kubevirt domain %s, devicename nodename %d nodeName:%s vmis:%v", domainName, len(ctx.nodeNameMap), nodeName, vmis)
 
 	// Start the Pod ReplicaSet
 	if vmis.mtype == IsMetaReplicaPod {
@@ -833,9 +833,12 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 	var nonLocalStatus string
 	var targetVMI *v1.VirtualMachineInstance
 	for _, vmi := range vmiList.Items {
+		logrus.Infof("getVMIStatus: repVmi:%s nodeName:%s vmiList vmi.ObjectMeta.Name:%s vmi.Status.NodeName:%s vmi.ObjectMeta.DeletionTimestamp:%v vmi.Status.Phase:%s",
+			repVmiName, nodeName, vmi.ObjectMeta.Name, vmi.Status.NodeName, vmi.ObjectMeta.DeletionTimestamp, vmi.Status.Phase)
 		if vmi.Status.NodeName == nodeName {
 			if vmi.GenerateName == repVmiName {
 				targetVMI = &vmi
+				logrus.Infof("getVMIStatus: repVmi:%s nodeName:%s picked vmi", repVmiName, nodeName)
 				break
 			}
 		} else {
@@ -847,6 +850,7 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 	if targetVMI == nil {
 		if nonLocalStatus != "" {
 			_, _ = checkAndReturnStatus(vmis, false) // reset the unknown timestamp
+			logrus.Infof("getVMIStatus: repVmi:%s nodeName:%s nonLocalStatus:%s", repVmiName, nodeName, nonLocalStatus)
 			return nonLocalStatus, nil
 		}
 		retStatus, err2 := checkAndReturnStatus(vmis, true)
@@ -854,6 +858,8 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 		return retStatus, err2
 	}
 	res := fmt.Sprintf("%v", targetVMI.Status.Phase)
+	logrus.Infof("getVMIStatus: repVmi:%s nodeName:%s targetVMI.ObjectMeta.Name:%s targetVMI.Status.NodeName:%s targetVMI.ObjectMeta.DeletionTimestamp:%v targetVMI.Status.Phase:%s res:%s",
+		repVmiName, nodeName, targetVMI.ObjectMeta.Name, targetVMI.Status.NodeName, targetVMI.ObjectMeta.DeletionTimestamp, targetVMI.Status.Phase, res)
 	_, _ = checkAndReturnStatus(vmis, false) // reset the unknown timestamp
 	return res, nil
 }
@@ -861,12 +867,12 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 // Inspired from kvm.go
 func waitForVMI(vmis *vmiMetaData, nodeName string, available bool) error {
 	vmiName := vmis.name
-	maxDelay := time.Minute * 5 // 5mins ?? lets keep it for now
+	maxDelay := time.Minute * 15 // 5mins ?? lets keep it for now
 	delay := time.Second
 	var waited time.Duration
 
 	for {
-		logrus.Infof("waitForVMI for %s %t: waiting for %v", vmiName, available, delay)
+		logrus.Infof("waitForVMI for %s on %s %t: waiting for %v", vmiName, nodeName, available, delay)
 		if delay != 0 {
 			time.Sleep(delay)
 			waited += delay
@@ -876,21 +882,22 @@ func waitForVMI(vmis *vmiMetaData, nodeName string, available bool) error {
 		if err != nil {
 
 			if available {
-				logrus.Infof("waitForVMI for %s %t done, state %v, err %v", vmiName, available, state, err)
+				logrus.Infof("waitForVMI for %s on %s %t done, state %v, err %v", vmiName, nodeName, available, state, err)
 			} else {
 				// Failed to get status, may be already deleted.
-				logrus.Infof("waitForVMI for %s %t done, state %v, err %v", vmiName, available, state, err)
+				logrus.Infof("waitForVMI for %s on %s %t done, state %v, err %v", vmiName, nodeName, available, state, err)
 				return nil
 			}
 		} else {
 			if state == "Running" && available {
+				logrus.Infof("waitForVMI %s %s %t found state==Running", vmiName, nodeName, available)
 				return nil
 			}
 		}
 
 		if waited > maxDelay {
 			// Give up, also log the state at the time of give up.
-			logrus.Warnf("waitForVMIfor %s %t: giving up at state : %s", vmiName, available, state)
+			logrus.Warnf("waitForVMI for %s on %s %t: giving up at state : %s", vmiName, nodeName, available, state)
 			if available {
 				return logError("VMI not found: error %v", err)
 			}

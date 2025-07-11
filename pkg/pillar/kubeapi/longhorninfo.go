@@ -424,6 +424,57 @@ func longhornReplicaDelete(lhRepName string) error {
 	return err
 }
 
+func longhornVolumeSetNode(lhVolName string, kubeNodeName string) error {
+	apiExists, err := longhornAPIExists()
+	if err != nil {
+		return err
+	}
+	if !apiExists {
+		return nil
+	}
+
+	config, err := GetKubeConfig()
+	if err != nil {
+		return err
+	}
+
+	lhClient, err := versioned.NewForConfig(config)
+	if err != nil {
+		return err
+	}
+
+	// First fix the logical volume object nodeID
+	vol, err := lhClient.LonghornV1beta2().Volumes("longhorn-system").Get(context.Background(), lhVolName, metav1.GetOptions{})
+	if err != nil {
+		return err
+	}
+	vol.Spec.NodeID = kubeNodeName
+	vol.Status.OwnerID = kubeNodeName
+	vol.Status.CurrentNodeID = kubeNodeName
+	_, err = lhClient.LonghornV1beta2().Volumes("longhorn-system").Update(context.Background(), vol, metav1.UpdateOptions{})
+	if err != nil {
+		return err
+	}
+
+	// Next fix the volume's engine nodeID
+	engines, err := lhClient.LonghornV1beta2().Engines("longhorn-system").List(context.Background(), metav1.ListOptions{})
+	if err != nil {
+		return nil
+	}
+	for _, eng := range engines.Items {
+		if eng.Spec.VolumeName != lhVolName {
+			continue
+		}
+		eng.Spec.NodeID = kubeNodeName
+		_, err := lhClient.LonghornV1beta2().Engines("longhorn-system").Update(context.Background(), &eng, metav1.UpdateOptions{})
+		if err != nil {
+			return err
+		}
+	}
+
+	return err
+}
+
 // longhornAPIExists will check for longhorn components installed and set
 // a flag in this module to gate all API access.  In some configurations
 // it is possible that longhorn is not installed but this intended configuration

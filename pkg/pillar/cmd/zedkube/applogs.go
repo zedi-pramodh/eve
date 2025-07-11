@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -25,6 +26,13 @@ import (
 // If DeletionTimestamp is not null, the pod is terminating.
 func isPodTerminating(pod corev1.Pod) bool {
 	return pod.ObjectMeta.DeletionTimestamp != nil
+}
+
+func getPodTerminatingTime(pod corev1.Pod) time.Duration {
+	if pod.ObjectMeta.DeletionTimestamp == nil {
+		return 0
+	}
+	return time.Since(pod.ObjectMeta.DeletionTimestamp.Time)
 }
 
 // collect App logs from pods which covers both containers and virt-launcher pods
@@ -164,6 +172,10 @@ func (z *zedkube) checkAppsStatus() {
 		//
 		// Both Pods will be of the pattern <appname>-<uuid prefix>-<pod uuid suffix>
 		terminatingVirtLauncherPod := ""
+		terminatingNodeName := ""
+		appDomainNameLbl := ""
+		foundNewSchedulingPod := false
+		var durationTerminating time.Duration
 
 		for _, pod := range pods.Items {
 			contVMIName := "virt-launcher-" + contName
@@ -177,6 +189,12 @@ func (z *zedkube) checkAppsStatus() {
 					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is terminating onNode:%s deletionTime:%v",
 						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName, pod.ObjectMeta.DeletionTimestamp)
 					terminatingVirtLauncherPod = pod.Name
+					terminatingNodeName = pod.Spec.NodeName
+					val, lblExists := pod.ObjectMeta.Labels["App-Domain-Name"]
+					if lblExists {
+						appDomainNameLbl = val
+					}
+					durationTerminating = getPodTerminatingTime(pod)
 					continue
 				}
 
@@ -193,6 +211,19 @@ func (z *zedkube) checkAppsStatus() {
 					log.Noticef("aiDisplayName:%s aiUUID:%s Pod:%s is attempting to start onNode:%s",
 						aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, pod.Name, pod.Spec.NodeName)
 				}
+				foundNewSchedulingPod = true
+			}
+		}
+
+		//
+		// Sometimes when a node becomes unreachable, the kubevirt control-plane seems to
+		// Get stuck and not schedule a new VMI or virt-launcher pod.  This tested step seems
+		// to push kubevirt into scheduling a new replica.
+		//
+		if terminatingVirtLauncherPod != "" && !foundNewSchedulingPod {
+			if durationTerminating > (time.Minute * 2) {
+				log.Noticef("aiDisplayName:%s aiUUID:%s only a terminating pod for 2+min, moving to detach", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
+				kubeapi.DetachOldWorkload(log, terminatingNodeName, appDomainNameLbl)
 			}
 		}
 
@@ -217,8 +248,7 @@ func (z *zedkube) checkAppsStatus() {
 			// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
 			if (oldStatus == nil || !oldStatus.DetachInProgress) && encAppStatus.ScheduledOnThisNode {
 				encAppStatus.DetachInProgress = true
-				// This may take some time, don't hold up the main zedkube thread.
-				go kubeapi.DetachOldWorkload(log, terminatingVirtLauncherPod)
+				kubeapi.DetachOldWorkload(log, terminatingNodeName, appDomainNameLbl)
 			}
 		}
 
@@ -238,7 +268,11 @@ func (z *zedkube) checkAppsStatus() {
 			// We need to do that becasue longhorn volumes are RWO and only one node can attach to those volumes.
 			// This will ensure at any given time only one node can write to those volumes, avoids corruptions.
 			// Basically if app is scheduled on this node, no other node should have volumeattachments.
-			z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
+			//z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
+
+			if _, err := os.Stat("/persist/vlpodpub"); err == nil {
+				z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
+			}
 		}
 	}
 }

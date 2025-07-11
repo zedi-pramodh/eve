@@ -11,11 +11,19 @@ Kubevirt_install() {
     logmsg "Installing patched Kubevirt"
     kubectl apply -f /etc/kubevirt-operator.yaml
     logmsg "Updating replica to 1 for virt-operator and virt-controller"
-    kubectl patch deployment virt-operator -n kubevirt --patch '{"spec":{"replicas": 1 }}'
+    kubectl patch deployment virt-operator -n kubevirt --patch '{"spec":{"replicas": 3 }}'
     kubectl apply -f https://github.com/kubevirt/kubevirt/releases/download/${KUBEVIRT_VERSION}/kubevirt-cr.yaml
-    kubectl patch KubeVirt kubevirt -n kubevirt --patch '{"spec": {"infra": {"replicas": 1}}}' --type='merge'
+    kubectl patch KubeVirt kubevirt -n kubevirt --patch '{"spec": {"infra": {"replicas": 3}}}' --type='merge'
     #Add kubevirt feature gates
     kubectl apply -f /etc/kubevirt-features.yaml
+}
+
+Kubevirt_config() {
+    if ! kubectl get namespace/kubevirt; then 
+        return
+    fi
+    kubectl patch deployment virt-operator -n kubevirt --patch '{"spec":{"replicas": 3 }}'
+    kubectl patch KubeVirt kubevirt -n kubevirt --patch '{"spec": {"infra": {"replicas": 3}}}' --type='merge'
 }
 
 Kubevirt_uninstall() {

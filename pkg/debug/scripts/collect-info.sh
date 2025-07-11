@@ -373,6 +373,10 @@ collect_kube_info()
            echo "============"
            eve exec kube kubectl top pod -A --sum
            echo "============"
+           echo "kubectl get volumeattachment"
+           echo "============"
+           eve exec kube kubectl get volumeattachment
+           echo "============"
         } > "$DIR/kube-info"
     fi
 }
