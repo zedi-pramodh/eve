@@ -413,6 +413,40 @@ func GetVolumeAttachmentFromPV(volName string, nodeName string, log *base.LogObj
 	return "", "", nil
 }
 
+// GetVolumeAttachmentFromHost : Return volume attachments on node
+func GetVolumeAttachmentFromHost(nodeName string, log *base.LogObject) ([]string, error) {
+	// Get the Kubernetes clientset
+	vaList := []string{}
+
+	clientset, err := GetClientSet()
+	if err != nil {
+		err = fmt.Errorf("failed to get clientset: %v", err)
+		log.Error(err)
+		return vaList, err
+	}
+	// List all VolumeAttachments and find the one corresponding to the PV
+	volumeAttachments, err := clientset.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		err = fmt.Errorf("Error listing VolumeAttachments: %v", err)
+		log.Error(err)
+		return vaList, err
+	}
+
+	// Iterate through VolumeAttachments to find one that references the PV's CSI volume handle
+	for _, va := range volumeAttachments.Items {
+		if va.Spec.NodeName != nodeName {
+			continue
+		}
+		if va.Spec.Source.PersistentVolumeName == nil {
+			continue
+		}
+		log.Noticef("VolumeAttachment found: %s (attached to node: %s)\n", va.Name, va.Spec.NodeName)
+		vaList = append(vaList, va.Name)
+	}
+
+	return vaList, nil
+}
+
 // DeleteVolumeAttachment : Delete the volumeattachment of given name
 func DeleteVolumeAttachment(vaName string, log *base.LogObject) error {
 	// Get the Kubernetes clientset
@@ -439,9 +473,41 @@ func DeleteVolumeAttachment(vaName string, log *base.LogObject) error {
 		log.Error(err)
 		return err
 	}
-
-	log.Noticef("Deleted volumeattachment %s", vaName)
 	return nil
+}
+
+// GetVolumeAttachmentAttached : Return true if VA is attached, not just requested
+func GetVolumeAttachmentAttached(volName string, nodeName string, log *base.LogObject) (bool, error) {
+	// Get the Kubernetes clientset
+	clientset, err := GetClientSet()
+	if err != nil {
+		err = fmt.Errorf("failed to get clientset: %v", err)
+		log.Error(err)
+		return false, err
+	}
+	// List all VolumeAttachments and find the one corresponding to the PV
+	volumeAttachments, err := clientset.StorageV1().VolumeAttachments().List(context.TODO(), metav1.ListOptions{})
+	if err != nil {
+		err = fmt.Errorf("Error listing VolumeAttachments: %v", err)
+		log.Error(err)
+		return false, err
+	}
+
+	// Iterate through VolumeAttachments to find one that references the PV's CSI volume handle
+	for _, va := range volumeAttachments.Items {
+		if va.Spec.NodeName != nodeName {
+			continue
+		}
+		if va.Spec.Source.PersistentVolumeName == nil {
+			continue
+		}
+		if *va.Spec.Source.PersistentVolumeName != volName {
+			continue
+		}
+		return va.Status.Attached, nil
+	}
+
+	return false, fmt.Errorf("VA for vol:%s node:%s not found", volName, nodeName)
 }
 
 func stringPtr(str string) *string {
