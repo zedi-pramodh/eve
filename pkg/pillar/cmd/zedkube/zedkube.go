@@ -419,7 +419,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 		select {
 		case change := <-subControllerCert.MsgChan():
 			subControllerCert.ProcessChange(change)
-			controllerCertInitialized = true
+			log.Noticef("EdgeNodeCert, len %d", len(subEdgeNodeCert.GetAll()))
+			if len(subEdgeNodeCert.GetAll()) > 0 {
+				controllerCertInitialized = true
+			}
 
 		case change := <-subEdgeNodeCert.MsgChan():
 			subEdgeNodeCert.ProcessChange(change)
