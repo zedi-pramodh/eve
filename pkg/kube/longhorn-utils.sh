@@ -4,6 +4,8 @@
 # SPDX-License-Identifier: Apache-2.0
 
 LONGHORN_VERSION=v1.6.3
+# Used to gate logging only once in Longhorn_is_ready
+bootLhRdyComplete=/tmp/lhrdycomplete
 
 longhorn_install() {
     node_name=$1
@@ -54,10 +56,42 @@ Longhorn_uninstall() {
     return 0
 }
 
-longhorn_is_ready() {
+Longhorn_is_ready() {
+    if ! kubectl get namespace/longhorn-system; then
+        return 0
+    fi
+
+    # All ds ready
     lhStatus=$(kubectl -n longhorn-system get daemonsets -o json | jq '.items[].status | .numberReady==.desiredNumberScheduled' | tr -d '\n')
     if [ "$lhStatus" != "truetruetrue" ]; then
-            return 1
+        return 1
+    fi
+    # ndm has all nodes
+    node=$(jq -r '.DeviceName' < /persist/status/zedagent/EdgeNodeInfo/global.json | tr -d '\n')
+    node=$(echo "$node" | tr '[:upper:]' '[:lower:]')
+    ndm=$(kubectl -n longhorn-system get engineimage -o json | jq .items[].status.nodeDeploymentMap)
+    dep=$(echo "$ndm" | jq --arg n "$node" '.[$n]')
+    if [ "$dep" != "true" ]; then
+        logmsg "lh node:$node engine not deployed"
+        # find engine pod name
+        pod=$(kubectl -n longhorn-system get pod -l longhorn.io/component=engine-image -o json | jq -r --arg n "$node" '.items[] | select(.spec.nodeName==$n) | .metadata.name')
+        if [ "$pod" = "" ]; then
+                # maybe restarting or not yet created (new install)
+                return 1
+        fi
+        phase=$(kubectl -n longhorn-system get "pod/${pod}" -o json | jq .status.phase)
+        if [ "$phase" != "Running" ]; then
+                # maybe restarting
+                return 1
+        fi
+        # delete it
+        kubectl -n longhorn-system delete "pod/${pod}"
+        logmsg "lh node:$node engine:$pod deleted for re-init due to ndm inconsistency"
+        return 1
+    fi
+    if [ ! -e "${bootLhRdyComplete}" ]; then
+        logmsg "longhorn ds ready, node:$node nodedeploymentmap:$(echo "$ndm" | tr -d '\n')"
+        touch "${bootLhRdyComplete}"
     fi
     return 0
 }
