@@ -269,10 +269,7 @@ func (z *zedkube) checkAppsStatus() {
 			// This will ensure at any given time only one node can write to those volumes, avoids corruptions.
 			// Basically if app is scheduled on this node, no other node should have volumeattachments.
 			//z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
-
-			if _, err := os.Stat("/persist/vlpodpub"); err == nil {
-				z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
-			}
+			z.pubENClusterAppStatus.Publish(aiconfig.Key(), encAppStatus)
 		}
 	}
 }
