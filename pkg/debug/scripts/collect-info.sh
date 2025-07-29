@@ -6,7 +6,7 @@
 
 # Script version, don't forget to bump up once something is changed
 
-VERSION=36
+VERSION=37
 # Add required packages here, it will be passed to "apk add".
 # Once something added here don't forget to add the same package
 # to the Dockerfile ('ENV PKGS' line) of the debug container,
@@ -377,6 +377,9 @@ collect_kube_info()
            echo "============"
            eve exec kube kubectl get volumeattachment
            echo "============"
+           echo "/usr/bin/all-kube-events.sh"
+           echo "============"
+           eve exec kube /usr/bin/all-kube-events.sh
         } > "$DIR/kube-info"
     fi
 }
