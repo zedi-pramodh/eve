@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"io"
-	"os"
 	"regexp"
 	"strings"
 	"time"
@@ -260,6 +259,13 @@ func (z *zedkube) checkAppsStatus() {
 		// 2) We are checking after app failover to other node, either this node network failed and came back or this just got rebooted
 		if oldStatus == nil || !oldStatus.Equal(&encAppStatus) {
 			log.Noticef("checkAppsStatus: aiDisplayName:%s aiUUID:%s status differ, publish", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
+			// May be app is just getting created on this node and hence there is no scheduled or running status yet.
+			// So do not publish anything if I am DNId for that app. Next iteration will publish.
+			// zedmanager will keep sending the app status to controller because status.NoUploadStatsToController will be false
+			// by default, if we errorneously publish app not scheduled on this node, zedmanager will not send status to controller.
+			if encAppStatus.IsDNidNode && !encAppStatus.ScheduledOnThisNode && !encAppStatus.StatusRunning {
+				continue
+			}
 			// If app scheduled on this node, could happen for 3 reasons.
 			// 1) I am designated node.
 			// 2) I am not designated node but failover happened.
