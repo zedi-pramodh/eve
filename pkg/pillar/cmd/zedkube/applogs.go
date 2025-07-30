@@ -125,7 +125,7 @@ func (z *zedkube) collectAppLogs() {
 	}
 }
 
-func (z *zedkube) checkAppsStatus() {
+func (z *zedkube) checkAppsStatus(wdFunc func()) {
 	sub := z.subAppInstanceConfig
 	items := sub.GetAll()
 	if len(items) == 0 {
@@ -153,6 +153,8 @@ func (z *zedkube) checkAppsStatus() {
 
 	var oldStatus *types.ENClusterAppStatus
 	for _, item := range items {
+		wdFunc()
+
 		aiconfig := item.(types.AppInstanceConfig)
 		encAppStatus := types.ENClusterAppStatus{
 			AppUUID:    aiconfig.UUIDandVersion.UUID,

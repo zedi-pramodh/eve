@@ -558,6 +558,10 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 	}
 	appLogTimer := time.NewTimer(logcollectInterval * time.Second)
 
+	zedkubeWdUpdate := func() {
+		ps.StillRunning(agentName, warningTime, errorTime)
+	}
+
 	log.Notice("zedkube online")
 
 	for {
@@ -570,7 +574,7 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 
 		case <-appLogTimer.C:
 			zedkubeCtx.collectAppLogs()
-			zedkubeCtx.checkAppsStatus()
+			zedkubeCtx.checkAppsStatus(zedkubeWdUpdate)
 			zedkubeCtx.collectKubeStats()
 			zedkubeCtx.collectKubeSvcs()
 			appLogTimer = time.NewTimer(logcollectInterval * time.Second)
