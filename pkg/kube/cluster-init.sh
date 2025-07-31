@@ -392,7 +392,7 @@ are_all_pods_ready() {
 check_and_run_vnc() {
   pid=$(pgrep -f "/usr/bin/virtctl vnc" )
   # if remote-console config file exist, and either has not started, or need to restart
-  if [ -f "$VMICONFIG_FILENAME" ] && { [ "$VNC_RUNNING" = false ] || [ -z "$pid" ]; } then
+  if [ -f "$VMICONFIG_FILENAME" ] && { [ "$VNC_RUNNING" = false ] || [ -z "$pid" ]; }; then
     vmiName=""
     vmiPort=""
 
@@ -550,6 +550,7 @@ check_cluster_config_change() {
         Registration_Cleanup
         rm /var/lib/left_edge_node_cluster_mode
         touch /var/lib/convert-to-single-node
+        # We're transitioning from cluster mode to single node, so reboot is still needed
         reboot
       fi
     else
@@ -592,11 +593,21 @@ check_cluster_config_change() {
             logmsg "provision config file for node to cluster mode"
             provision_cluster_config_file true
 
-            logmsg "WARNING: changing the node to cluster mode, rebooting the node"
+            if [ "$is_bootstrap" = "false" ]; then
+              # we got here because we know the bootstrap node is already running
+              # For a non-bootstrap node, create transition file and record timestamp
+              # This will be checked by check_cluster_transition_done function
+              # We have seen in some cases, the k3s server on this node can not join the cluster
+              # due to CA cert issues, and reboot is needed to get out of this state
+              # so we do not always reboot here, only if it is needed
+              date +%s > /var/lib/transition-to-cluster
+              logmsg "Created transition file for non-bootstrap node joining cluster"
+            else
+              logmsg "bootstrap node, wait for k3s to start"
+            fi
 
-            # Sometimes just restarting k3s is not working, and keep getting server CA untrusted error,
-            # but a reboot after that normally works.
-            reboot
+            WAIT_FOR_CLUSTER_TRANSITION=false
+            break
           else
             sleep 10
           fi
@@ -617,9 +628,52 @@ check_cluster_config_change() {
     fi
 }
 
+# Function to check if the cluster transition is complete
+check_cluster_transition_done() {
+    # If the transition file does not exist, nothing to do
+    if [ ! -f /var/lib/transition-to-cluster ]; then
+        return 0
+    fi
+
+    logmsg "Checking cluster transition status..."
+
+    # Try to get nodes from the cluster
+    if kubectl get nodes >/dev/null 2>&1; then
+        # Check if we have at least two nodes in ready state
+        ready_nodes=$(kubectl get nodes --no-headers | grep " Ready " | wc -l)
+        total_nodes=$(kubectl get nodes --no-headers | wc -l)
+
+        logmsg "Found $ready_nodes ready nodes out of $total_nodes total nodes"
+
+        if [ "$ready_nodes" -ge 2 ]; then
+            logmsg "Cluster transition complete: At least 2 nodes are ready"
+            rm -f /var/lib/transition-to-cluster
+            return 0
+        fi
+    fi
+
+    # Check if we've been waiting too long (10 minutes)
+    transition_timestamp=$(cat /var/lib/transition-to-cluster)
+    current_timestamp=$(date +%s)
+    elapsed_time=$((current_timestamp - transition_timestamp))
+
+    if [ "$elapsed_time" -ge 600 ]; then # 10 minutes in seconds
+        logmsg "Cluster transition timeout: Been waiting for ${elapsed_time} seconds"
+        # Update timestamp and reboot
+        date +%s > /var/lib/transition-to-cluster
+        logmsg "Rebooting system to retry cluster transition..."
+        reboot
+    else
+        logmsg "Still waiting for cluster transition: ${elapsed_time} seconds elapsed (timeout: 600 seconds)"
+    fi
+
+    return 1
+}
+
 monitor_cluster_config_change() {
     while true; do
         check_cluster_config_change
+        check_cluster_transition_done
         sleep 15
     done
 }
@@ -819,7 +873,7 @@ else # a restart case, found all_components_initialized
     # got the cluster config, make the config.ymal now
    logmsg "Cluster config status ok, provision config.yaml and bootstrap-config.yaml"
 
-    # if we just converted to single node, then we need to wait for the bootstrap
+    # if we just converted to cluster mode, then we need to wait for the bootstrap
     # 'cluster' status before moving on to cluster mode
     provision_cluster_config_file $convert_to_single_node
     convert_to_single_node=false
