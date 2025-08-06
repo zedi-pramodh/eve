@@ -1825,8 +1825,8 @@ func addEFIBootLoader(spec *v1.VirtualMachineInstanceSpec) *v1.VirtualMachineIns
 	// Refer https://pkg.go.dev/kubevirt.io/api/core/v1#EFI
 	spec.Domain.Firmware.Bootloader = &v1.Bootloader{
 		EFI: &v1.EFI{
-			SecureBoot: ptrBool(false),
-			Persistent: ptrBool(false),
+			SecureBoot: ptrBool(false), // this requires SMM CPU feature to be enabled
+			Persistent: ptrBool(true),
 		},
 	}
 	return spec
