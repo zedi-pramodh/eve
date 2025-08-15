@@ -48,7 +48,7 @@ const (
 	waitForPodCheckCounter = 5  // Check 5 times
 	waitForPodCheckTime    = 15 // Check every 15 seconds, don't wait for too long to cause watchdog
 	tolerateSec            = 15 // Pod/VMI reschedule delay after node unreachable seconds
-	unknownToHaltMinutes   = 5  // If VMI is unknown for 5 minutes, return halt state
+	unknownToHaltMinutes   = 30 // If VMI is unknown for this long, return halt state
 )
 
 // MetaDataType is a type for different Domain types
@@ -592,6 +592,42 @@ func (ctx kubevirtContext) Create(domainName string, cfgFilename string, config 
 	return ctx.vmiList[domainName].domainID, nil
 }
 
+func scheduledOnMe(ctx kubevirtContext, vmirsName string) (onMe bool, err error) {
+	err = getConfig(&ctx)
+	if err != nil {
+		return false, err
+	}
+	kubeconfig := ctx.kubeConfig
+
+	nodeName, ok := ctx.nodeNameMap["nodename"]
+	if !ok {
+		return false, fmt.Errorf("Failed to get nodeName")
+	}
+
+	virtClient, err := kubecli.GetKubevirtClientFromRESTConfig(kubeconfig)
+	if err != nil {
+		logrus.Errorf("couldn't get the kubernetes client API config: %v", err)
+		return false, err
+	}
+
+	vmirs, err := virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Get(vmirsName, metav1.GetOptions{})
+	if err != nil {
+		return false, err
+	}
+	appDomainNameSelector := vmirs.Status.LabelSelector
+
+	vmis, err := virtClient.VirtualMachineInstance(kubeapi.EVEKubeNameSpace).List(context.Background(), &metav1.ListOptions{
+		LabelSelector: appDomainNameSelector,
+	})
+	if err != nil {
+		return false, err
+	}
+
+	vmiNode := vmis.Items[0].Status.NodeName
+
+	return (vmiNode == nodeName), nil
+}
+
 // There is no such thing as stop VMI, so delete it.
 func (ctx kubevirtContext) Stop(domainName string, force bool) error {
 	logrus.Debugf("Stop called for Domain: %s", domainName)
@@ -612,6 +648,15 @@ func (ctx kubevirtContext) Stop(domainName string, force bool) error {
 	if !ok {
 		return logError("domain %s failed to get vmlist", domainName)
 	}
+
+	onMe, err := scheduledOnMe(ctx, vmis.name)
+	if err != nil {
+		return err
+	}
+	if !onMe {
+		return nil
+	}
+
 	if vmis.mtype == IsMetaReplicaPod {
 		err = StopReplicaPodContainer(kubeconfig, vmis.name)
 	} else if vmis.mtype == IsMetaReplicaVMI {
@@ -650,6 +695,15 @@ func (ctx kubevirtContext) Delete(domainName string) (result error) {
 	if !ok {
 		return logError("delete domain %s failed to get vmlist", domainName)
 	}
+
+	onMe, err := scheduledOnMe(ctx, vmis.name)
+	if err != nil {
+		return err
+	}
+	if !onMe {
+		return nil
+	}
+
 	if vmis.mtype == IsMetaReplicaPod {
 		err = StopReplicaPodContainer(kubeconfig, vmis.name)
 	} else if vmis.mtype == IsMetaReplicaVMI {
@@ -688,6 +742,7 @@ func StopReplicaVMI(kubeconfig *rest.Config, repVmiName string) error {
 
 	logrus.Infof("Attempt to stop VMI:%s vmirs deleted", repVmiName)
 	// Stop the VMI ReplicaSet
+
 	err = virtClient.ReplicaSet(kubeapi.EVEKubeNameSpace).Delete(repVmiName, &metav1.DeleteOptions{})
 	if kerrors.IsNotFound(err) {
 		logrus.Infof("Stop VMI Replicaset, Domain already deleted: %v", repVmiName)
@@ -723,6 +778,15 @@ func (ctx kubevirtContext) Info(domainName string) (int, types.SwState, error) {
 	if !ok {
 		return 0, types.HALTED, logError("info domain %s failed to get vmlist", domainName)
 	}
+
+	onMe, err := scheduledOnMe(ctx, vmis.name)
+	if err != nil {
+		return 0, types.BROKEN, logError("Failed to determine scheduled node")
+	}
+	if !onMe {
+		return 0, types.UNKNOWN, nil
+	}
+
 	if vmis.mtype == IsMetaReplicaPod {
 		res, err = InfoReplicaSetContainer(ctx, vmis)
 	} else {
@@ -871,7 +935,7 @@ func getVMIStatus(vmis *vmiMetaData, nodeName string) (string, error) {
 // Inspired from kvm.go
 func waitForVMI(vmis *vmiMetaData, nodeName string, available bool) error {
 	vmiName := vmis.name
-	maxDelay := time.Minute * 15 // 5mins ?? lets keep it for now
+	maxDelay := time.Minute * 30 // 5mins ?? lets keep it for now
 	delay := time.Second
 	var waited time.Duration
 

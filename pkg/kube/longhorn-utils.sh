@@ -56,6 +56,26 @@ Longhorn_uninstall() {
     return 0
 }
 
+longhorn_node_create() {
+    node="$1"
+    cat <<EOF > /tmp/lh-node-"${node}"-.yaml
+---
+apiVersion: longhorn.io/v1beta1
+kind: Node
+metadata:
+  name: ${node}
+  namespace: longhorn-system
+spec:
+  allowScheduling: true
+  evictionRequested: false
+  tags: []
+EOF
+    kubectl apply -f /tmp/lh-node-"${node}"-.yaml
+}
+
+# Longhorn_is_ready is expected to be called periodically during runtime
+# It attempts to detect and recover from various installation issues
+# which block unattended install/config experience.
 Longhorn_is_ready() {
     if ! kubectl get namespace/longhorn-system; then
         return 0
@@ -64,11 +84,35 @@ Longhorn_is_ready() {
     # All ds ready
     lhStatus=$(kubectl -n longhorn-system get daemonsets -o json | jq '.items[].status | .numberReady==.desiredNumberScheduled' | tr -d '\n')
     if [ "$lhStatus" != "truetruetrue" ]; then
+        if [ -e "${bootLhRdyComplete}" ]; then
+                # Allow the final ready log message when its reached.
+                rm "$bootLhRdyComplete"
+        fi
         return 1
     fi
-    # ndm has all nodes
+
+    if [ ! -e /persist/status/zedagent/EdgeNodeInfo/global.json ]; then
+        return 1
+    fi
+
     node=$(jq -r '.DeviceName' < /persist/status/zedagent/EdgeNodeInfo/global.json | tr -d '\n')
     node=$(echo "$node" | tr '[:upper:]' '[:lower:]')
+
+    # longhorn node exists
+    if ! kubectl -n longhorn-system get nodes.longhorn.io "$node"; then
+        if [ -e "${bootLhRdyComplete}" ]; then
+                # Allow the final ready log message when its reached.
+                rm "$bootLhRdyComplete"
+        fi
+
+        logmsg "lh nodes.longhorn.io $node missing, creating"
+
+        # Recovery attempt
+        longhorn_node_create "$node"
+        return 1
+    fi
+
+    # ndm has all nodes
     ndm=$(kubectl -n longhorn-system get engineimage -o json | jq .items[].status.nodeDeploymentMap)
     dep=$(echo "$ndm" | jq --arg n "$node" '.[$n]')
     if [ "$dep" != "true" ]; then

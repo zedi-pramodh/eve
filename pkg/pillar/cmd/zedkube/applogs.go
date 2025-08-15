@@ -223,8 +223,19 @@ func (z *zedkube) checkAppsStatus(wdFunc func()) {
 		//
 		if terminatingVirtLauncherPod != "" && !foundNewSchedulingPod {
 			if durationTerminating > (time.Minute * 2) {
-				log.Noticef("aiDisplayName:%s aiUUID:%s only a terminating pod for 2+min, moving to detach", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
-				kubeapi.DetachOldWorkload(log, terminatingNodeName, appDomainNameLbl)
+				log.Noticef("aiDisplayName:%s aiUUID:%s only a terminating pod for 2+min, Need to reset vmirs", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
+				if z.isDecisionNode() {
+					log.Noticef("aiDisplayName:%s aiUUID:%s only a terminating pod for 2+min, moving to reset vmirs", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID)
+					vmiRsName, err := kubeapi.GetVmiRsName(log, appDomainNameLbl)
+					if err != nil {
+						log.Errorf("aiDisplayName:%s aiUUID:%s vmirsname get err:%v", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, err)
+					} else {
+						err := kubeapi.DetachUtilVmirsReplicaReset(log, vmiRsName)
+						if err != nil {
+							log.Errorf("aiDisplayName:%s aiUUID:%s replica reset for vmirs:%s err:%v", aiconfig.DisplayName, aiconfig.UUIDandVersion.UUID, vmiRsName, err)
+						}
+					}
+				}
 			}
 		}
 
@@ -311,4 +322,12 @@ func (z *zedkube) handleKubePodsGetError(items, stItems map[string]interface{}) 
 			}
 		}
 	}
+}
+
+// Interface to determining a node allowed to make cluster-wide operations
+func (z *zedkube) isDecisionNode() (isNode bool) {
+	if z.isKubeStatsLeader.Load() {
+		isNode = true
+	}
+	return isNode
 }

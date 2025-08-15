@@ -572,6 +572,36 @@ func DetachUtilVmirsReplicaSet(log *base.LogObject, vmiRsName string, replicaCou
 	return nil
 }
 
+func DetachUtilVmirsReplicaReset(log *base.LogObject, vmiRsName string) (err error) {
+	vmiRsResetMaxTries := 60
+	vmiRsResetTry := 0
+	// Retries to handle connection issues to virt-api
+	for {
+		vmiRsResetTry++
+		if vmiRsResetTry > vmiRsResetMaxTries {
+			log.Errorf("DetachOldWorkload vmirs scale reset timeout, breaking...")
+			break
+		}
+		time.Sleep(time.Second * 1)
+		err = DetachUtilVmirsReplicaSet(log, vmiRsName, 0)
+		if err != nil {
+			log.Errorf("DetachOldWorkload retrying scale:%s to 0 err:%v", vmiRsName, err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+
+		err = DetachUtilVmirsReplicaSet(log, vmiRsName, 1)
+		if err != nil {
+			log.Errorf("DetachOldWorkload retrying scale:%s to 1 err:%v", vmiRsName, err)
+			time.Sleep(time.Second * 2)
+			continue
+		}
+		log.Noticef("DetachOldWorkload vmirs:%s scale reset", vmiRsName)
+		return nil
+	}
+	return
+}
+
 func GetVmiRsName(log *base.LogObject, appDomainName string) (string, error) {
 	vmiName, err := GetVmiName(log, appDomainName)
 	if err != nil {
@@ -841,32 +871,7 @@ func DetachOldWorkload(log *base.LogObject, failedNodeName string, appDomainName
 
 	// Push the kubevirt control plane to schedule new pod.
 	if vmiRsName != "" {
-		vmiRsResetMaxTries := 30
-		vmiRsResetTry := 0
-		// Retries to handle connection issues to virt-api
-		for {
-			vmiRsResetTry++
-			if vmiRsResetTry > vmiRsResetMaxTries {
-				log.Errorf("DetachOldWorkload vmirs scale reset timeout, breaking...")
-				break
-			}
-			time.Sleep(time.Second * 1)
-			err = DetachUtilVmirsReplicaSet(log, vmiRsName, 0)
-			if err != nil {
-				log.Errorf("DetachOldWorkload retrying scale:%s to 0 err:%v", vmiRsName, err)
-				time.Sleep(time.Second * 1)
-				continue
-			}
-
-			err = DetachUtilVmirsReplicaSet(log, vmiRsName, 1)
-			if err != nil {
-				log.Errorf("DetachOldWorkload retrying scale:%s to 1 err:%v", vmiRsName, err)
-				time.Sleep(time.Second * 1)
-				continue
-			}
-			log.Noticef("DetachOldWorkload vmirs:%s scale reset", vmiRsName)
-			break
-		}
+		DetachUtilVmirsReplicaReset(log, vmiRsName)
 	}
 
 	if virtLauncherPodName != "" {
