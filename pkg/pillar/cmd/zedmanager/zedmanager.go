@@ -509,7 +509,9 @@ func Run(ps *pubsub.PubSub, loggerArg *logrus.Logger, logArg *base.LogObject, ar
 			checkDelayedStartApps(&ctx)
 
 		case <-priorityStartTicker.C:
-			checkLowPriorityApps(&ctx)
+			if !ctx.hvTypeKube {
+				checkLowPriorityApps(&ctx)
+			}
 		case <-stillRunning.C:
 		}
 		ps.StillRunning(agentName, warningTime, errorTime)

@@ -203,7 +203,7 @@ func doUpdate(ctx *zedmanagerContext,
 			hasPriority = true
 		}
 	}
-	if !hasPriority && !status.NoBootPriority {
+	if !ctx.hvTypeKube && !hasPriority && !status.NoBootPriority {
 		log.Functionf("low priority app %s", uuidStr)
 		status.NoBootPriority = true
 		return true
