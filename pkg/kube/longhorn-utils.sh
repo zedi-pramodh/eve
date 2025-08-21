@@ -58,9 +58,9 @@ Longhorn_uninstall() {
 
 longhorn_node_create() {
     node="$1"
-    cat <<EOF > /tmp/lh-node-"${node}"-.yaml
+    cat <<EOF > /tmp/lh-node-"${node}".yaml
 ---
-apiVersion: longhorn.io/v1beta1
+apiVersion: longhorn.io/v1beta2
 kind: Node
 metadata:
   name: ${node}
@@ -70,7 +70,7 @@ spec:
   evictionRequested: false
   tags: []
 EOF
-    kubectl apply -f /tmp/lh-node-"${node}"-.yaml
+    kubectl apply -f /tmp/lh-node-"${node}".yaml
 }
 
 # Longhorn_is_ready is expected to be called periodically during runtime
