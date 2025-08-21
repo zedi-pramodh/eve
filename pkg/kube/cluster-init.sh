@@ -563,6 +563,12 @@ check_cluster_config_change() {
             logmsg "got the EdgeNodeClusterStatus successfully"
             # mark it cluster mode before changing the config file
             touch /var/lib/edge-node-cluster-mode
+            if Registration_ConfigExists; then
+                # Hold on, don't apply yet, complete conversion to base mode first
+                if [ ! -f /var/lib/left_edge_node_cluster_mode ]; then
+                        uninstall_components
+                fi
+            fi
 
             # rotate the token with the new token
             if [ "$is_bootstrap" = "true" ]; then
@@ -618,13 +624,9 @@ check_cluster_config_change() {
     fi
     logmsg "Check cluster config change done"
 
-    ## Convert system
-    Registration_CheckApply
-    if Registration_Exists; then
-        if [ ! -f /var/lib/left_edge_node_cluster_mode ]; then
-                uninstall_components &
-                touch /var/lib/left_edge_node_cluster_mode
-        fi
+    ## A conversion to base-k3s mode should be complete here, now complete registration
+    if [ -e /var/lib/left_edge_node_cluster_mode ]; then
+        Registration_CheckApply
     fi
 }
 
@@ -683,11 +685,16 @@ monitor_cluster_config_change() {
 # these are cluster-wide operations, only one nodes initiates it
 # Marked via the Registration_Exists fence
 uninstall_components() {
-        logmsg "Post-registration cleanup steps: wait api available"
+        if [ -e /tmp/edge-node-cluster-uninstall-inprogress ]; then
+                return
+        fi
+        touch /tmp/edge-node-cluster-uninstall-inprogress
+
+        logmsg "convert-to-basek3s: wait api available"
         while ! kubectl cluster-info; do
                 sleep 5
         done
-        logmsg "Post-registration cleanup steps: kubectl cluster-info ready, wait nodes ready"
+        logmsg "convert-to-basek3s: kubectl cluster-info ready, wait nodes ready"
         while true; do
                 # shellcheck disable=SC2281,SC2154,SC2046,SC2016
                 $not_ready_nodes=$(kubectl get nodes -o go-template='{{range .items}}{{ $ready := false }}{{range .status.conditions}}{{if and (eq .type "Ready") (eq .status "True")}}{{ $ready = true }}{{end}}{{end}}{{if not $ready}}{{.metadata.name}}{{"\n"}}{{end}}{{end}}')
@@ -696,25 +703,30 @@ uninstall_components() {
                 fi
                 sleep 5
         done
-        logmsg "Post-registration cleanup steps: nodes ready"
+        logmsg "convert-to-basek3s: nodes ready"
 
-        logmsg "Cleanup Descheduler"
+        logmsg "convert-to-basek3s: Cleanup Descheduler"
         Descheduler_uninstall
 
-        logmsg "Cleanup longhorn"
+        logmsg "convert-to-basek3s: Cleanup longhorn"
         Longhorn_uninstall
         rm /var/lib/longhorn_initialized
 
-        logmsg "Cleanup cdi"
+        logmsg "convert-to-basek3s: Cleanup cdi"
         Cdi_uninstall
 
-        logmsg "Cleanup kubevirt"
+        logmsg "convert-to-basek3s: Cleanup kubevirt"
         Kubevirt_uninstall
         rm /var/lib/kubevirt_initialized
 
-        logmsg "Cleanup multus"
+        logmsg "convert-to-basek3s: Cleanup multus"
         Multus_uninstall
         rm /var/lib/multus_initialized
+
+        logmsg "convert-to-basek3s: complete"
+        rm /tmp/edge-node-cluster-uninstall-inprogress
+
+        touch /var/lib/left_edge_node_cluster_mode
 }
 
 # provision the config.yaml and bootstrap-config.yaml for cluster node, passing $1 as k3s needs initializing
