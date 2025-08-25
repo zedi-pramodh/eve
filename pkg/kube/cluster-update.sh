@@ -155,6 +155,10 @@ Update_CheckClusterComponents() {
 # on boot. This is to allow rebalancing apps via re-scheduling them with an aim to meet
 # affinity as specified in the pod config.
 Update_RunDeschedulerOnBoot() {
+    if [ ! -f /var/lib/descheduler-enabled ]; then
+        return
+    fi
+
     # Currently only run once per boot
     if [ -f /tmp/descheduler-ran-onboot ]; then
         return
