@@ -548,6 +548,13 @@ check_cluster_config_change() {
           return 0
         fi
         Registration_Cleanup
+
+        # Delete myself from the cluster gracefully before converting to single node.
+        logmsg "Draining $HOSTNAME before removing from cluster"
+        kubectl drain $HOSTNAME --delete-emptydir-data --ignore-daemonsets
+        logmsg "Deleting $HOSTNAME from the cluster"
+        kubectl delete node $HOSTNAME --force --grace-period=0
+
         rm /var/lib/left_edge_node_cluster_mode
         touch /var/lib/convert-to-single-node
         # We're transitioning from cluster mode to single node, so reboot is still needed
