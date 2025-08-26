@@ -123,7 +123,7 @@ Longhorn_is_ready() {
                 # maybe restarting or not yet created (new install)
                 return 1
         fi
-        phase=$(kubectl -n longhorn-system get "pod/${pod}" -o json | jq .status.phase)
+        phase=$(kubectl -n longhorn-system get "pod/${pod}" -o json | jq -r .status.phase)
         if [ "$phase" != "Running" ]; then
                 # maybe restarting
                 return 1
@@ -131,6 +131,18 @@ Longhorn_is_ready() {
         # delete it
         kubectl -n longhorn-system delete "pod/${pod}"
         logmsg "lh node:$node engine:$pod deleted for re-init due to ndm inconsistency"
+
+        # Find the owner of the node deployment map and cycle that pod so it regenerates.
+        # In some conditions the 
+        ndmOwnerID=$(kubectl -n longhorn-system get engineimage -o json | jq -r .items[].status.ownerID)
+        if [ "$ndmOwnerID" != "" ]; then
+            ndmMgrPod=$(kubectl -n longhorn-system get pod -l app=longhorn-manager  -o json | jq -r --arg n "$ndmOwnerID" '.items[] | select(.spec.nodeName==$n) | .metadata.name')
+            if [ "$ndmMgrPod" != "" ]; then
+                logmsg "lh ownerID node:$ndmOwnerID manager:$ndmMgrPod deleted for re-init due to ndm inconsistency"
+                kubectl -n longhorn-system delete "pod/${ndmMgrPod}"
+            fi
+        fi
+        
         return 1
     fi
     if [ ! -e "${bootLhRdyComplete}" ]; then
