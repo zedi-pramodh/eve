@@ -866,7 +866,7 @@ pkg/external-boot-image/build.yml: pkg/external-boot-image/build.yml.in pkg/xen-
 	$(QUIET)tools/compose-external-boot-image-yml.sh $< $@ $(shell echo $(KERNEL_TAG) | cut -d':' -f2) $(shell $(LINUXKIT) pkg $(LINUXKIT_ORG_TARGET) show-tag pkg/xen-tools | cut -d':' -f2)
 eve-external-boot-image: pkg/external-boot-image/build.yml
 pkg/kube/external-boot-image.tar: pkg/external-boot-image
-	$(MAKE) cache-export IMAGE=$(shell $(LINUXKIT) pkg $(LINUXKIT_ORG_TARGET) show-tag pkg/external-boot-image) OUTFILE=pkg/kube/external-boot-image.tar
+	# $(MAKE) cache-export IMAGE=$(shell $(LINUXKIT) pkg $(LINUXKIT_ORG_TARGET) show-tag pkg/external-boot-image) OUTFILE=pkg/kube/external-boot-image.tar
 	rm -f pkg/external-boot-image/build.yml
 pkg/kube: pkg/kube/external-boot-image.tar eve-kube
 	$(QUIET): $@: Succeeded
