@@ -113,8 +113,9 @@ func parseContentInfoConfig(ctx *getconfigContext,
 		}
 
 		log.Noticef("parseContentInfo designated ID copy from volume config: %v, contentid %v, url %s", controllerDNID, contentConfig.ContentID, contentConfig.RelativeURL)
-
-		publishContentTreeConfig(ctx, *contentConfig)
+		if contentConfig.IsLocal {
+			publishContentTreeConfig(ctx, *contentConfig)
+		}
 	}
 	ctx.pubContentTreeConfig.SignalRestarted()
 	log.Functionf("parsing content info config done\n")
