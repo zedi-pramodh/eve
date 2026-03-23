@@ -164,7 +164,7 @@ func cpuVMMOverhead(maxCpus int64, vcpus int64) int64 {
 }
 
 // memory allocated by QEMU for its own purposes.
-// statistical analysis did not revile any correlation between
+// statistical analysis did not reveal any correlation between
 // VM configuration (devices, nr of vcpus, etc) and this number
 // however the size of disk space affects it. Probably some internal
 // QEMU caches are allocated based on the size of the disk image.
