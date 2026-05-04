@@ -154,6 +154,51 @@ func GetVfIfaceName(index uint8, ifname string) string {
 	return fmt.Sprintf("%svf%d", ifname, index)
 }
 
+// BindVFToVfioPCI binds the VF at the given PCI BDF to the vfio-pci driver.
+//
+// EVE creates VFs with sriov_drivers_autoprobe=0, leaving them driverless so
+// the host kernel driver (igbvf/iavf/ixgbevf) does not claim them.  For the
+// kube path, the upstream sriov-network-device-plugin's default selector
+// requires VFs to already be bound to vfio-pci before it will enumerate them
+// and advertise the resource to kubelet.
+//
+// Sequence:
+//  1. Write "vfio-pci" to <vf>/driver_override so the next probe attaches
+//     vfio-pci specifically (overrides the kernel's vendor:device match).
+//  2. Write the VF's BDF to /sys/bus/pci/drivers_probe to trigger probing.
+//
+// Idempotent: if vfio-pci is already bound, drivers_probe is a no-op.
+func BindVFToVfioPCI(vfBDF string) error {
+	overridePath := filepath.Join("/sys/bus/pci/devices", vfBDF, "driver_override")
+	if err := os.WriteFile(overridePath, []byte("vfio-pci"), 0); err != nil {
+		return fmt.Errorf("write driver_override for %s: %w", vfBDF, err)
+	}
+	if err := os.WriteFile("/sys/bus/pci/drivers_probe", []byte(vfBDF), 0); err != nil {
+		return fmt.Errorf("write drivers_probe for %s: %w", vfBDF, err)
+	}
+	return nil
+}
+
+// GetPFIfaceFromVFBDF returns the kernel netdev name of the Physical Function
+// that owns the given Virtual Function PCI BDF.
+//
+// Path: /sys/bus/pci/devices/<vf-bdf>/physfn/net/<ifname>
+//   - "physfn" is a symlink the kernel maintains on every VF, pointing back
+//     to its parent PF.
+//   - "net/<ifname>" lists the netdev(s) attached to the PF.  A normal SR-IOV
+//     PF has exactly one netdev so picking the first entry is unambiguous.
+func GetPFIfaceFromVFBDF(vfBDF string) (string, error) {
+	netDir := filepath.Join("/sys/bus/pci/devices", vfBDF, "physfn", "net")
+	entries, err := os.ReadDir(netDir)
+	if err != nil {
+		return "", fmt.Errorf("readdir %s: %w", netDir, err)
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no netdev under %s", netDir)
+	}
+	return entries[0].Name(), nil
+}
+
 // ParseVfIfaceName returns index of VF and its PF from name
 func ParseVfIfaceName(ifname string) (uint8, string, error) {
 	var iface string

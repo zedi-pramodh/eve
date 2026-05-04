@@ -3449,6 +3449,20 @@ func handlePhysicalIOAdapterListImpl(ctxArg interface{}, key string,
 			// Lookup since it could have changed
 			ib = aa.LookupIoBundlePhylabel(ib.Phylabel)
 			updatePortAndPciBackIoBundle(ctx, ib)
+			// Reconcile SR-IOV VF creation on every steady-state pass.  The
+			// !Initialized branch above only runs once at first boot; if the
+			// controller bumps Vfs.Count after that (or republishes config with
+			// a count that the kernel hasn't applied yet — e.g. sriov_numvfs is
+			// reset to 0 on every reboot), setupVf must run again.  CreateVF is
+			// idempotent (early-returns when numvfs already matches), so calling
+			// it here on every event is cheap.
+			if ib != nil && ib.Type == types.IoNetEthPF && ib.Vfs.Count > 0 {
+				if err := setupVf(ib, aa, log); err != nil {
+					err = fmt.Errorf("setupVf: %w", err)
+					log.Error(err)
+					ib.Error.Append(err)
+				}
+			}
 		} else {
 			log.Functionf("handlePhysicalIOAdapterListImpl: Adapter %s "+
 				"- No Change", phyAdapter.Phylabel)
@@ -3479,6 +3493,16 @@ func setupVf(ib *types.IoBundle, aa *types.AssignableAdapters, log *base.LogObje
 			return fmt.Errorf("createVfIoBundle failed %w", err)
 		}
 		aa.AddOrUpdateIoBundle(log, vfIb)
+
+		// Bind the VF to vfio-pci so the kube sriov-network-device-plugin can
+		// enumerate it and advertise the resource to kubelet.  EVE created VFs
+		// with autoprobe disabled, so the VF arrives driverless; without an
+		// explicit bind here, the plugin's `drivers: vfio-pci` selector matches
+		// nothing and no VFs are ever advertised.  Non-fatal: log and continue
+		// so a single failing VF doesn't block the others.
+		if err := sriov.BindVFToVfioPCI(vf.PciLong); err != nil {
+			log.Warnf("setupVf: bind VF %s to vfio-pci: %v", vf.PciLong, err)
+		}
 	}
 
 	return nil
@@ -3501,14 +3525,21 @@ func createVfIoBundle(pfIb types.IoBundle, vf sriov.EthVF) (types.IoBundle, erro
 	}
 	if vfUserConfig.Mac != "" {
 		vfIb.MacAddr = vfUserConfig.Mac
-		if err := sriov.SetupVfHardwareAddr(vfIb.Ifname, vfIb.MacAddr, vf.Index); err != nil {
+		// netlink.LinkSetVfHardwareAddr must be called on the Physical Function link,
+		// not the VF link — use pfIb.Ifname (e.g. "eth0"), not vfIb.Ifname ("eth0vf0").
+		if err := sriov.SetupVfHardwareAddr(pfIb.Ifname, vfIb.MacAddr, vf.Index); err != nil {
 			return types.IoBundle{}, fmt.Errorf("setupVfHardwareAddr failed %s", err)
 		}
 	}
 	if vfUserConfig.VlanID != 0 {
-		if err := sriov.SetupVfVlan(vfIb.Ifname, vf.Index, vf.VlanID); err != nil {
+		// Use pfIb.Ifname (PF) for the same reason as above.
+		// Use vfUserConfig.VlanID (user-configured), not vf.VlanID which is always
+		// 0 for a freshly created VF (GetVf does not read the current VLAN from sysfs).
+		if err := sriov.SetupVfVlan(pfIb.Ifname, vf.Index, vfUserConfig.VlanID); err != nil {
 			return types.IoBundle{}, fmt.Errorf("setupVfVlan failed %s", err)
 		}
+		// Persist the configured VLAN in VfParams so callers (e.g. hypervisor) know it.
+		vfIb.VfParams.VlanID = vfUserConfig.VlanID
 	}
 	return vfIb, nil
 }
@@ -3786,6 +3817,23 @@ func checkAndFillIoBundle(ib *types.IoBundle) (bool, error) {
 		changed = true
 		log.Functionf("checkAndFillIoBundle(%d %s %s) %s found unique %s",
 			ib.Type, ib.Phylabel, ib.AssignmentGroup, long, unique)
+	}
+
+	// VFs declared statically in the device model (Type=IoNetEthVF) skip
+	// createVfIoBundle, so VfParams.PFIface is empty.  Resolve the parent PF's
+	// ifname from sysfs once at parse time so downstream consumers (notably the
+	// kubevirt SR-IOV path) don't need a runtime fallback.
+	if ib.Type == types.IoNetEthVF && ib.VfParams.PFIface == "" {
+		pfIface, err := sriov.GetPFIfaceFromVFBDF(long)
+		if err != nil {
+			log.Warnf("checkAndFillIoBundle(%s %s): can't resolve PF ifname for VF %s: %v",
+				ib.Phylabel, ib.AssignmentGroup, long, err)
+		} else {
+			ib.VfParams.PFIface = pfIface
+			changed = true
+			log.Functionf("checkAndFillIoBundle(%s %s) %s VF parent PFIface=%s",
+				ib.Phylabel, ib.AssignmentGroup, long, pfIface)
+		}
 	}
 	return changed, nil
 }

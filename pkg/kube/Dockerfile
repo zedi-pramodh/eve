@@ -1,5 +1,12 @@
 # syntax=docker/dockerfile-upstream:1.5.0-rc2-labs
 
+# sriov-cni upstream image is used only as a source of the prebuilt sriov
+# binary; we copy it into our final image at build time so we don't need a
+# DaemonSet at runtime just to stage the binary on each node.  Pinned by
+# digest for reproducibility.  v2.7.0 ships amd64 only, matching the
+# previous DaemonSet's nodeSelector.
+FROM --platform=linux/amd64 ghcr.io/k8snetworkplumbingwg/sriov-cni@sha256:fce504e683275ab59215065ddf6433ca80d1b4b53f0d4b0cdf037da6701c7cb4 AS sriov-cni-bin
+
 FROM lfedge/eve-alpine:1f744180283ffb4eabcc3862531aeacf1de886b3 AS build
 ARG TARGETARCH
 ENV PKGS alpine-baselayout musl-utils iproute2 iptables curl openrc \
@@ -14,6 +21,7 @@ RUN mkdir -p /out/usr/bin /tmp/etcdtmp && \
     cp "/tmp/etcdtmp/etcd-${ETCDCTL_VERSION}-linux-${TARGETARCH}/etcdctl" /out/usr/bin/etcdctl && \
     chmod +x /out/usr/bin/etcdctl && \
     rm -rf /tmp/etcd.tar.gz /tmp/etcdtmp
+COPY --from=sriov-cni-bin /usr/bin/sriov /out/usr/bin/sriov
 
 COPY eve-bridge /plugins/eve-bridge
 WORKDIR /plugins/eve-bridge
@@ -102,6 +110,8 @@ RUN chmod +x /usr/bin/kubevip-apply.sh /usr/bin/kubevip-delete.sh
 RUN mkdir -p /etc/nvidia-container-runtime
 COPY nvidia-container-runtime/config.toml /etc/nvidia-container-runtime
 COPY nvidia-container-runtime/nvidia-device-plugin-18.0.yml /etc/k3s-manifests/
+
+COPY sriov/sriov-device-plugin.yaml /etc/k3s-manifests/
 
 ARG TARGETARCH
 

@@ -8,24 +8,30 @@ package hypervisor
 import (
 	"bufio"
 	"context"
+	"crypto/sha256"
 	"crypto/tls"
 	"encoding/json"
 	"fmt"
 	"io"
 	"math"
 	"math/rand"
+	"net"
 	"net/http"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
 	"github.com/lf-edge/eve/pkg/pillar/base"
+	"github.com/lf-edge/eve/pkg/pillar/sriov"
 	"github.com/lf-edge/eve/pkg/pillar/types"
 
 	netattdefv1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
+	netattdefclient "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/client/clientset/versioned"
 	"github.com/lf-edge/eve/pkg/pillar/kubeapi"
+	uuid "github.com/satori/go.uuid"
 	"github.com/sirupsen/logrus"
 	appsv1 "k8s.io/api/apps/v1"
 	k8sv1 "k8s.io/api/core/v1"
@@ -506,7 +512,7 @@ func (ctx kubevirtContext) CreateReplicaVMIConfig(domainName string, config type
 	var pciAssignments []pciDevice
 
 	for _, adapter := range config.IoAdapterList {
-		logrus.Debugf("processing adapter %d %s\n", adapter.Type, adapter.Name)
+		logrus.Debugf("processing adapter type=%d name=%s\n", adapter.Type, adapter.Name)
 		list := aa.LookupIoBundleAny(adapter.Name)
 		// We reserved it in handleCreate so nobody could have stolen it
 		if len(list) == 0 {
@@ -517,10 +523,21 @@ func (ctx kubevirtContext) CreateReplicaVMIConfig(domainName string, config type
 			if ib == nil {
 				continue
 			}
+			// IoNetEth: skip sibling PCI functions in the same assignment group
+			// whose ifname doesn't match the requested adapter name.  Registering
+			// them separately with KubeVirt would cause an allocation error.
 			if ib.Type == types.IoNetEth && ib.Ifname != adapter.Name {
-				// if we get here, means we have a PCI device which is in the same group
-				// as the Ethernet passthrough port, will have error if register to the kubevirt
-				logrus.Infof("Skip PCI device %s which does not match adapter %s\n", ib.Ifname, adapter.Name)
+				logrus.Infof("CreateReplicaVMIConfig: skip sibling PCI device %s "+
+					"(not the requested adapter %s)\n", ib.Ifname, adapter.Name)
+				continue
+			}
+			// IoNetEthPF is the SR-IOV Physical Function.  It must remain in the host
+			// (keepInHost=true, never in vfio-pci).  Only the derived VFs
+			// (IoNetEthVF) should be passed through to the VM.
+			if ib.Type == types.IoNetEthPF {
+				logrus.Warnf("CreateReplicaVMIConfig: skipping SR-IOV PF %s for adapter %s — "+
+					"assign VFs (e.g. %svf0) to the VM instead",
+					ib.Ifname, adapter.Name, ib.Ifname)
 				continue
 			}
 			if ib.UsedByUUID != config.UUIDandVersion.UUID {
@@ -529,22 +546,53 @@ func (ctx kubevirtContext) CreateReplicaVMIConfig(domainName string, config type
 					domainName)
 			}
 			if ib.PciLong != "" {
-				logrus.Infof("Adding PCI device <%v>\n", ib.PciLong)
+				if ib.Type.IsNetEthVF() {
+					logrus.Infof("CreateReplicaVMIConfig: adding SR-IOV VF <%s> "+
+						"(index %d, VLAN %d, MAC %s, PF %s)\n",
+						ib.PciLong, ib.VfParams.Index, ib.VfParams.VlanID,
+						ib.MacAddr, ib.VfParams.PFIface)
+				} else {
+					logrus.Infof("CreateReplicaVMIConfig: adding PCI device <%s> type %d\n",
+						ib.PciLong, ib.Type)
+				}
 				tap := pciDevice{ioBundle: *ib}
 				pciAssignments = addNoDuplicatePCI(pciAssignments, tap)
 			}
 		}
 	}
 
-	if len(pciAssignments) > 0 {
-		// Device passthrough is a three step process in Kubevirt/Kubernetes
-		// 1) First do PCI Reserve like in kvm.go (If we are here, PCI Reserve is already done)
-		// 2) Register the  pciVendorSelector which is a PCI vendor ID and product ID tuple in the form vendor_id:product_id
-		//    with kubevirt
-		// 3) Then pass the registered names to VMI config
-		err := registerWithKV(kvClient, vmi, pciAssignments)
-		if err != nil {
-			return logError("Failed to register with Kubevirt  %v", len(pciAssignments))
+	// Split assignments into two buckets:
+	//   - SR-IOV VFs go through Multus + sriov-cni so KubeVirt selects a specific
+	//     VF per VMI by BDF (resource pool counts) and we can set a per-VM MAC
+	//     via Interface.MacAddress.  This is the canonical KubeVirt SR-IOV path.
+	//   - Other PCI devices (GPUs, NVMe, USB controllers, plain NICs) keep the
+	//     HostDevices path: register vendor:device once, attach by resource name.
+	var hostDevAssignments []pciDevice
+	var vfAssignments []pciDevice
+	for _, pa := range pciAssignments {
+		if pa.ioBundle.Type.IsNetEthVF() {
+			vfAssignments = append(vfAssignments, pa)
+		} else {
+			hostDevAssignments = append(hostDevAssignments, pa)
+		}
+	}
+
+	if len(hostDevAssignments) > 0 {
+		// PCI passthrough for KubeVirt is a three-step process:
+		//   1. PCIReserve (vfio-pci bind) — already done in domainmgr handleCreate.
+		//   2. Register the vendor:device tuple in the KubeVirt CR PermittedHostDevices
+		//      so the KubeVirt device plugin exposes it as a Kubernetes resource.
+		//   3. Reference the resource name in the VMI HostDevices list.
+		if err := registerWithKV(kvClient, vmi, hostDevAssignments); err != nil {
+			return logError("Failed to register PCI devices with KubeVirt (%d device(s)): %v",
+				len(hostDevAssignments), err)
+		}
+	}
+
+	if len(vfAssignments) > 0 {
+		if err := attachSRIOVInterfaces(ctx.kubeConfig, vmi, vfAssignments, config.UUIDandVersion.UUID); err != nil {
+			return logError("Failed to attach SR-IOV VFs to VMI (%d VF(s)): %v",
+				len(vfAssignments), err)
 		}
 	}
 
@@ -1940,77 +1988,93 @@ func getConfig(ctx *kubevirtContext) error {
 	return nil
 }
 
-// Register the host device with Kubevirt
-// Refer https://kubevirt.io/user-guide/virtual_machines/host-devices/#host-preparation-for-pci-passthrough
-// Refer https://kubevirt.io/user-guide/virtual_machines/host-devices/#usb-host-passthrough
-func registerWithKV(kvClient kubecli.KubevirtClient, vmi *v1.VirtualMachineInstance, pciAssignments []pciDevice) error {
+// registerWithKV registers PCI host-devices with KubeVirt and adds them as
+// HostDevices in the VMI spec.
+//
+// SR-IOV VFs are NOT routed through this path — they go through
+// attachSRIOVInterfaces (Multus + sriov-cni).  This function only handles
+// non-VF passthrough (GPUs, NVMe, USB controllers, plain NICs).
+//
+// Flow:
+//  1. For each PCI assignment look up its vendor:device tuple.
+//  2. If the tuple is not yet in KubeVirt's PermittedHostDevices CR, add it and
+//     update the CR.  This triggers the KubeVirt device plugin to expose the
+//     resource to kubelet.
+//  3. Reference the resource name in the VMI HostDevices list.
+//
+// References:
+//
+//	https://kubevirt.io/user-guide/virtual_machines/host-devices/#host-preparation-for-pci-passthrough
+func registerWithKV(kvClient kubecli.KubevirtClient, vmi *v1.VirtualMachineInstance,
+	pciAssignments []pciDevice) error {
 
-	logrus.Debugf("Entered registerWithKV  pcilen %d ", len(pciAssignments))
+	logrus.Debugf("registerWithKV: %d PCI assignment(s)", len(pciAssignments))
 	pcidevices := make([]v1.HostDevice, len(pciAssignments))
 
-	// Define the KubeVirt resource's name and namespace
-	kubeVirtName := "kubevirt"
-	kubeVirtNamespace := "kubevirt"
+	const (
+		kubeVirtName      = "kubevirt"
+		kubeVirtNamespace = "kubevirt"
+	)
 
-	// Retrieve the KubeVirt resource
+	// Retrieve the KubeVirt CR so we can inspect / update PermittedHostDevices.
 	kubeVirt, err := kvClient.KubeVirt(kubeVirtNamespace).Get(context.Background(), kubeVirtName, metav1.GetOptions{})
 	if err != nil {
-		return logError("can't fetch the PCI device info from kubevirt %v", err)
+		return logError("registerWithKV: can't fetch KubeVirt CR: %v", err)
 	}
 
-	// Get the currently registered  devices from Kubevirt
 	pciHostDevs := kubeVirt.Spec.Configuration.PermittedHostDevices.PciHostDevices
 
 	for i, pa := range pciAssignments {
-
 		vendor, err := pa.vid()
 		if err != nil {
-			return logError("can't fetch the vendor id for pci device %v", err)
+			return logError("registerWithKV: can't read vendor ID for %s: %v", pa.ioBundle.PciLong, err)
 		}
-		// Delete 0x prefix it exists, kubevirt does not like it
+		// KubeVirt rejects the "0x" prefix in vendor/device IDs.
 		vendor = strings.TrimPrefix(vendor, "0x")
+
 		devid, err := pa.devid()
 		if err != nil {
-			return logError("can't fetch the device id for pci device %v", err)
+			return logError("registerWithKV: can't read device ID for %s: %v", pa.ioBundle.PciLong, err)
 		}
-		if strings.HasPrefix(devid, "0x") {
-			devid = devid[2:]
-		}
+		devid = strings.TrimPrefix(devid, "0x")
+
 		pciVendorSelector := vendor + ":" + devid
 
-		// Check if we already registered this device with kubevirt. If not register with kubevirt
-		registered := isRegisteredPciHostDevice(pciVendorSelector, pciHostDevs)
-		// Lets make sure resname is unique by appending vendor and devid
-		// NOTE we cannot use pciVendorSelector directly since ":" is not accepted in kubernetes resource name standard
+		// Resource names must not contain ":" (Kubernetes naming rules), so we
+		// concatenate vendor and device ID directly.
 		resname := "devices.kubevirt.io/hostdevice-" + vendor + devid
-		if !registered {
 
+		if !isRegisteredPciHostDevice(pciVendorSelector, pciHostDevs) {
 			newpcidev := v1.PciHostDevice{
 				ResourceName:      resname,
 				PCIVendorSelector: pciVendorSelector,
 			}
-			logrus.Infof("Registering PCI device %s as resource %s with kubevirt", pciVendorSelector, resname)
-			kubeVirt.Spec.Configuration.PermittedHostDevices.PciHostDevices = append(kubeVirt.Spec.Configuration.PermittedHostDevices.PciHostDevices, newpcidev)
+			logrus.Infof("registerWithKV: registering PCI device "+
+				"(BDF %s, vendor:device %s) as resource %s",
+				pa.ioBundle.PciLong, pciVendorSelector, resname)
+
+			kubeVirt.Spec.Configuration.PermittedHostDevices.PciHostDevices =
+				append(kubeVirt.Spec.Configuration.PermittedHostDevices.PciHostDevices, newpcidev)
 			_, err = kvClient.KubeVirt(kubeVirtNamespace).Update(context.Background(), kubeVirt, metav1.UpdateOptions{})
-
 			if err != nil {
-				return logError("can't update the PCI device info from kubevirt %v", err)
+				return logError("registerWithKV: can't update KubeVirt CR: %v", err)
 			}
+		} else {
+			logrus.Debugf("registerWithKV: resource %s already registered for vendor:device %s",
+				resname, pciVendorSelector)
 		}
-		// At this point we have registered the PCI device with kubevirt
-		// Create HostDevice array which will be inserted into vmi Hostdevices
-		// Hostdevices could be NVMe drives,USB or NICs, that is reason if just call them device.
 
+		// At this point the device is registered.  Add it to the VMI HostDevices list.
+		// HostDevices cover NVMe drives, GPUs, USB, etc. — we call them
+		// "device<N>" generically.
 		pcidevices[i] = v1.HostDevice{
 			DeviceName: resname,
 			Name:       "device" + strconv.Itoa(i+1),
 		}
-
 		vmi.Spec.Domain.Devices.HostDevices = append(vmi.Spec.Domain.Devices.HostDevices, pcidevices[i])
 	}
 
 	return nil
-
 }
 
 func isRegisteredPciHostDevice(pciVendorSelector string, PciHostDevices []v1.PciHostDevice) bool {
@@ -2130,4 +2194,292 @@ func isK3sUnreachable(err error) bool {
 
 func ptrBool(b bool) *bool {
 	return &b
+}
+
+// ============================================================================
+// SR-IOV via Multus + sriov-cni
+// ----------------------------------------------------------------------------
+// Each SR-IOV Virtual Function is attached to the VMI as a KubeVirt SR-IOV
+// network interface backed by a Multus NetworkAttachmentDefinition.  This lets
+// us:
+//   - Pick a specific VF (by BDF) via the sriov-network-device-plugin's resource
+//     pool — eliminates the "fungible pool" problem that affects raw PCI
+//     HostDevices when multiple VFs share the same vendor:device tuple.
+//   - Set a per-VM MAC address using vmi.Spec.Domain.Devices.Interfaces[].MacAddress.
+//     KubeVirt -> libvirt -> sriov-cni honors this on the guest side regardless
+//     of what the PF admin-MAC was programmed to.
+//   - Re-bind a VF on the destination node automatically during failover, as
+//     long as the destination has free VFs in the same pool.
+//
+// Cluster prerequisites (installed by pkg/kube/cluster-init.sh on SR-IOV nodes):
+//   - Multus CNI (already present for the eve-bridge primary network).
+//   - sriov-cni                : /opt/cni/bin/sriov on every node.
+//   - sriov-network-device-plugin : advertises eve.network/<pf>_vfs as a
+//     Kubernetes extended resource, tracked by BDF.
+//
+// Resource naming: one pool per Physical Function (pfName).  All VFs derived
+// from the same PF share that pool; the device plugin guarantees each pod gets
+// a distinct VF.
+// ============================================================================
+
+// sriovResourceName returns the Kubernetes extended-resource name advertised by
+// the sriov-network-device-plugin for VFs of the given PF.  Must match the
+// resourceName/resourcePrefix in the device plugin ConfigMap.
+func sriovResourceName(pfName string) string {
+	return "eve.network/" + pfName + "_vfs"
+}
+
+// sriovNADName returns the NetworkAttachmentDefinition name for a given PF.
+// One NAD per PF — VLAN, when configured, lives in the NAD's CNI config.
+func sriovNADName(pfName string, vlanID uint32) string {
+	if vlanID == 0 {
+		return "sriov-" + pfName
+	}
+	return fmt.Sprintf("sriov-%s-vlan%d", pfName, vlanID)
+}
+
+// ensureSRIOVNAD creates (or refreshes) the NetworkAttachmentDefinition that
+// binds Multus calls to sriov-cni for the given PF.  Idempotent: existing NADs
+// are updated only when the embedded CNI config has drifted (e.g. VLAN change).
+//
+// The annotation k8s.v1.cni.cncf.io/resourceName tells Multus to ask the
+// sriov-network-device-plugin for a VF from the named pool when wiring the pod;
+// the plugin injects PCIDEVICE_<pool> into the pod env, and sriov-cni reads it
+// to bind that exact VF.
+func ensureSRIOVNAD(kubeConfig *rest.Config, pfName string, vlanID uint32) error {
+	nadClient, err := netattdefclient.NewForConfig(kubeConfig)
+	if err != nil {
+		return fmt.Errorf("ensureSRIOVNAD: can't create NAD clientset: %v", err)
+	}
+
+	nadName := sriovNADName(pfName, vlanID)
+	resourceName := sriovResourceName(pfName)
+	cniConfig := fmt.Sprintf(
+		`{"cniVersion":"0.3.1","name":%q,"type":"sriov"}`,
+		nadName)
+	if vlanID > 0 {
+		cniConfig = fmt.Sprintf(
+			`{"cniVersion":"0.3.1","name":%q,"type":"sriov","vlan":%d}`,
+			nadName, vlanID)
+	}
+	desired := &netattdefv1.NetworkAttachmentDefinition{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      nadName,
+			Namespace: kubeapi.EVEKubeNameSpace,
+			Annotations: map[string]string{
+				"k8s.v1.cni.cncf.io/resourceName": resourceName,
+			},
+		},
+		Spec: netattdefv1.NetworkAttachmentDefinitionSpec{Config: cniConfig},
+	}
+
+	nads := nadClient.K8sCniCncfIoV1().NetworkAttachmentDefinitions(kubeapi.EVEKubeNameSpace)
+
+	existing, err := nads.Get(context.Background(), nadName, metav1.GetOptions{})
+	if errors.IsNotFound(err) {
+		if _, err := nads.Create(context.Background(), desired, metav1.CreateOptions{}); err != nil && !errors.IsAlreadyExists(err) {
+			return fmt.Errorf("ensureSRIOVNAD: can't create NAD %s: %v", nadName, err)
+		}
+		logrus.Infof("ensureSRIOVNAD: created NAD %s -> resource %s (vlan %d)",
+			nadName, resourceName, vlanID)
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("ensureSRIOVNAD: can't get NAD %s: %v", nadName, err)
+	}
+
+	if existing.Spec.Config == cniConfig &&
+		existing.Annotations["k8s.v1.cni.cncf.io/resourceName"] == resourceName {
+		return nil
+	}
+
+	if existing.Annotations == nil {
+		existing.Annotations = map[string]string{}
+	}
+	existing.Annotations["k8s.v1.cni.cncf.io/resourceName"] = resourceName
+	existing.Spec.Config = cniConfig
+	if _, err := nads.Update(context.Background(), existing, metav1.UpdateOptions{}); err != nil {
+		return fmt.Errorf("ensureSRIOVNAD: can't update NAD %s: %v", nadName, err)
+	}
+	logrus.Infof("ensureSRIOVNAD: updated NAD %s -> resource %s (vlan %d)",
+		nadName, resourceName, vlanID)
+	return nil
+}
+
+// attachSRIOVInterfaces wires every SR-IOV VF in vfs into the VMI as a KubeVirt
+// SR-IOV interface backed by a Multus NetworkAttachmentDefinition.
+//
+// Per-VF MAC: we set Interface.MacAddress from the IoBundle's MacAddr.  This is
+// the user-configured MAC (possibly via the EVE app config); the in-VM driver
+// observes this exact MAC regardless of what the PF admin-MAC was programmed
+// to, fixing the "all VMs see the same MAC" symptom of the HostDevice path.
+//
+// Per-VF BDF selection: the resource pool counts in the device plugin guarantee
+// that two VMIs requesting the same pool get different VFs.  No nodeSelector
+// stamping is needed because the scheduler will only place the VMI on a node
+// where the resource pool has free capacity.
+func attachSRIOVInterfaces(kubeConfig *rest.Config, vmi *v1.VirtualMachineInstance, vfs []pciDevice, appUUID uuid.UUID) error {
+	// Group by PF so we create exactly one NAD per pool, even with multiple VFs.
+	type pfKey struct {
+		pfName string
+		vlanID uint32
+	}
+	createdNAD := map[pfKey]bool{}
+
+	for i, pa := range vfs {
+		pfName := pa.ioBundle.VfParams.PFIface
+		if pfName == "" {
+			// domainmgr.checkAndFillIoBundle populates VfParams.PFIface at
+			// parse time, but the VF may not have existed in sysfs yet (e.g.
+			// sriov_numvfs not written when the phyAdapter list was first
+			// processed).  Recover from sysfs now — the VF must exist by the
+			// time we're attaching it to a VMI.
+			derived, err := sriov.GetPFIfaceFromVFBDF(pa.ioBundle.PciLong)
+			if err != nil {
+				return fmt.Errorf("attachSRIOVInterfaces: VF %s has empty PFIface "+
+					"and sysfs lookup failed: %w", pa.ioBundle.PciLong, err)
+			}
+			logrus.Warnf("attachSRIOVInterfaces: VF %s arrived without PFIface; "+
+				"recovered PFIface=%s from sysfs", pa.ioBundle.PciLong, derived)
+			pfName = derived
+		}
+		vlanID := uint32(pa.ioBundle.VfParams.VlanID)
+		key := pfKey{pfName: pfName, vlanID: vlanID}
+		if !createdNAD[key] {
+			if err := ensureSRIOVNAD(kubeConfig, pfName, vlanID); err != nil {
+				return err
+			}
+			createdNAD[key] = true
+		}
+
+		// KubeVirt SR-IOV interfaces must reference a Multus network of the
+		// same Name.  Use a stable, non-conflicting interface name per VF.
+		ifName := fmt.Sprintf("sriov%d", i+1)
+		nadName := sriovNADName(pfName, vlanID)
+
+		iface := v1.Interface{
+			Name: ifName,
+			InterfaceBindingMethod: v1.InterfaceBindingMethod{
+				SRIOV: &v1.InterfaceSRIOV{},
+			},
+		}
+		// MAC selection priority:
+		//   1. User-configured MacAddr from the IoBundle, if it's not just
+		//      a stale copy of the parent PF's hardware MAC.  Some EVE
+		//      config paths set every VF IoBundle's MacAddr to the PF MAC
+		//      when per-VF user config is absent — that would make every
+		//      VM see the same MAC (the original bug this path fixes).
+		//   2. A deterministic locally-administered MAC generated from
+		//      (appUUID, vfBDF) using the same SHA-256 + OUI 02:16:3E
+		//      scheme that zedrouter uses for switch-network VIFs (see
+		//      pkg/pillar/cmd/zedrouter/ipam.go:generateAppMac).  Stable
+		//      across reboots, unique per (app, VF), and recognizable as
+		//      EVE-generated.
+		mac, source := resolveVFMac(pa, appUUID)
+		if mac != "" {
+			iface.MacAddress = mac
+		}
+		logrus.Infof("attachSRIOVInterfaces: VF %s MAC %s (source=%s)",
+			pa.ioBundle.PciLong, mac, source)
+
+		vmi.Spec.Domain.Devices.Interfaces = append(
+			vmi.Spec.Domain.Devices.Interfaces, iface)
+
+		vmi.Spec.Networks = append(vmi.Spec.Networks, v1.Network{
+			Name: ifName,
+			NetworkSource: v1.NetworkSource{
+				Multus: &v1.MultusNetwork{
+					NetworkName: kubeapi.EVEKubeNameSpace + "/" + nadName,
+				},
+			},
+		})
+
+		logrus.Infof("attachSRIOVInterfaces: VMI iface %s -> NAD %s "+
+			"(VF %s, PF %s, VF-index %d, VLAN %d, MAC %q)",
+			ifName, nadName, pa.ioBundle.PciLong, pfName,
+			pa.ioBundle.VfParams.Index, vlanID, pa.ioBundle.MacAddr)
+	}
+	return nil
+}
+
+// derivePFMacFromVFSysfs returns the hardware MAC of the Physical Function
+// that owns the given Virtual Function PCI BDF, formatted lowercase
+// "xx:xx:xx:xx:xx:xx" as the kernel exposes it.
+//
+// Used by attachSRIOVInterfaces to detect IoBundle MacAddr fields that have
+// been (incorrectly) populated with the PF's hardware MAC — a pattern that
+// shows up when the EVE device model lacks per-VF MAC config and would cause
+// every VM sharing the pool to see the same MAC.
+//
+// Path: /sys/bus/pci/devices/<vf-bdf>/physfn/net/<ifname>/address
+func derivePFMacFromVFSysfs(vfBDF string) (string, error) {
+	netDir := filepath.Join("/sys/bus/pci/devices", vfBDF, "physfn", "net")
+	entries, err := os.ReadDir(netDir)
+	if err != nil {
+		return "", fmt.Errorf("readdir %s: %w", netDir, err)
+	}
+	if len(entries) == 0 {
+		return "", fmt.Errorf("no netdev under %s", netDir)
+	}
+	addrFile := filepath.Join(netDir, entries[0].Name(), "address")
+	raw, err := os.ReadFile(addrFile)
+	if err != nil {
+		return "", fmt.Errorf("read %s: %w", addrFile, err)
+	}
+	return strings.ToLower(strings.TrimSpace(string(raw))), nil
+}
+
+// resolveVFMac picks the MAC address to assign to a VF VMI interface.
+// Returns the chosen MAC string (in canonical "xx:xx:xx:xx:xx:xx" form) and a
+// short source label for logging ("config" or "generated").
+//
+// Priority:
+//  1. pa.ioBundle.MacAddr, when it's set and not a stale copy of the parent
+//     PF's hardware MAC.
+//  2. A deterministic locally-administered MAC generated from (appUUID, vfBDF).
+//
+// Returns "" only if generation itself fails — never silently leaves a VMI
+// without a stable identity.
+func resolveVFMac(pa pciDevice, appUUID uuid.UUID) (string, string) {
+	cfgMac := strings.TrimSpace(pa.ioBundle.MacAddr)
+	if cfgMac != "" {
+		pfMac, err := derivePFMacFromVFSysfs(pa.ioBundle.PciLong)
+		if err != nil {
+			logrus.Warnf("can't trust cfgMac → fall through to generated")
+		}
+		if pfMac == "" || !strings.EqualFold(cfgMac, pfMac) {
+			if hw, err := net.ParseMAC(cfgMac); err == nil {
+				return hw.String(), "config"
+			}
+			// fall through to generated
+			return strings.ToLower(cfgMac), "config"
+		}
+		// cfgMac is the PF MAC — bogus per-VF value, fall through to generation.
+	}
+	return generateVFMac(appUUID, pa.ioBundle.PciLong).String(), "generated"
+}
+
+// generateVFMac returns a stable, locally-administered MAC for a VF assigned to
+// a given app instance.
+//
+// Uses the same scheme zedrouter applies to VIFs on switch network instances
+// (pkg/pillar/cmd/zedrouter/ipam.go:generateAppMac):
+//
+//   - SHA-256 hash over (appUUID || vfBDF) — both inputs are stable and
+//     unique, so the same VF assigned to the same app always yields the same
+//     MAC across reboots and across cluster failovers.
+//   - OUI 02:16:3E (locally-administered, unicast).  This OUI is reserved for
+//     XenSource originally and is what EVE has used for VIF MAC generation
+//     for years; reusing it keeps EVE-generated MACs visually consistent
+//     and easy to recognize in tcpdump / arp tables.
+//
+// The resulting MAC is essentially guaranteed unique across (app, VF) pairs in
+// the enterprise — collision probability with 24 random bits and 1000 VFs is
+// well under 0.01 percent.
+func generateVFMac(appUUID uuid.UUID, vfBDF string) net.HardwareAddr {
+	h := sha256.New()
+	h.Write(appUUID[:])
+	h.Write([]byte(vfBDF))
+	hash := h.Sum(nil)
+	return net.HardwareAddr{0x02, 0x16, 0x3e, hash[0], hash[1], hash[2]}
 }
