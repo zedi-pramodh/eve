@@ -423,6 +423,22 @@ const (
 	// TUIMonitorLogLevel: log level for TUI monitor
 	TUIMonitorLogLevel GlobalSettingKey = "debug.tui.loglevel"
 
+	// IGPUGOPFile: filename (basename only) of a proprietary Intel GOP
+	// Option ROM placed under /persist/vault/gop/.  Used for iGPU
+	// passthrough to provide a pre-OS UEFI framebuffer.  Empty (default)
+	// or a missing file falls back to the bundled VfioIgdPkg ROM (OS
+	// display still works; just no pre-OS framebuffer).
+	IGPUGOPFile GlobalSettingKey = "igpu.gop"
+
+	// EnableEFIDebug: when true, OVMF DEBUG() output is captured to
+	// /run/hypervisor/kvm/<dom>/efi-debug.log via QEMU's isa-debugcon at
+	// I/O port 0x402.  Off by default.  Note that DEBUG() macros are
+	// compiled out in a TARGET=RELEASE OVMF build (EVE's current
+	// default); enabling this knob on a RELEASE OVMF creates the log
+	// file but it stays empty.  Useful primarily for diagnosing iGPU
+	// passthrough firmware-side issues with a TARGET=DEBUG OVMF rebuild.
+	EnableEFIDebug GlobalSettingKey = "debug.enable.efi"
+
 	// MsrvPrometheusMetricsRequestPerSecond: limit the number of requests per second
 	MsrvPrometheusMetricsRequestPerSecond GlobalSettingKey = "msrv.prometheus.metrics.rps"
 	// MsrvPrometheusMetricsBurst: limit the burst of requests
@@ -1149,6 +1165,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddBoolItem(NetworkLocalLegacyMACAddress, false)
 	configItemSpecMap.AddBoolItem(MemoryMonitorEnabled, false)
 	configItemSpecMap.AddBoolItem(DHCPEnableVendorClassID, true)
+	configItemSpecMap.AddBoolItem(EnableEFIDebug, false)
 
 	// Add TriState Items
 	configItemSpecMap.AddTriStateItem(NetworkFallbackAnyEth, TS_DISABLED)
@@ -1166,6 +1183,7 @@ func NewConfigItemSpecMap() ConfigItemSpecMap {
 	configItemSpecMap.AddStringItem(FmlCustomResolution, FmlResolutionUnset, blankValidator)
 	configItemSpecMap.AddStringItem(AppBootOrder, "", validateBootOrder)
 	configItemSpecMap.AddStringItem(TUIMonitorLogLevel, "info", blankValidator)
+	configItemSpecMap.AddStringItem(IGPUGOPFile, "", validateGOPRomFilename)
 	configItemSpecMap.AddStringItem(EdgeviewPublicKeys, "", blankValidator)
 
 	// Log deduplication and filtering settings
@@ -1241,6 +1259,19 @@ func validateBootOrder(bootOrder string) error {
 	default:
 		return fmt.Errorf("validateBootOrder: invalid boot order '%s', must be '', 'usb', or 'nousb'", bootOrder)
 	}
+}
+
+// validateGOPRomFilename - require a plain basename with no path separators
+// or traversal components.  Empty is allowed and means "use the bundled
+// VfioIgdPkg ROM".  The file is loaded from /persist/vault/gop/ at runtime.
+func validateGOPRomFilename(filename string) error {
+	if filename == "" {
+		return nil
+	}
+	if strings.ContainsAny(filename, `/\`) || filename == ".." || filename == "." {
+		return fmt.Errorf("validateGOPRomFilename: %q must be a basename under /persist/vault/gop (no path separators)", filename)
+	}
+	return nil
 }
 
 // validateSyslogKernelLevel - Wrapper for validating syslog and kernel
