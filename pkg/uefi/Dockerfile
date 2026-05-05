@@ -44,6 +44,14 @@ RUN set -e ; [ ! -d /edk2 ] ||  [ ! -d /edk2-patches/${EDK_VERSION} ] || \
 
 FROM build-edk2 AS build-amd64
 
+# VfioIgdPkg: open-source EFI option-ROM package for Intel iGPU
+# passthrough.  Builds IgdAssignmentDxe, which sets the guest's emulated
+# ASLS / BDSM PCI config registers correctly so the guest's iGPU
+# driver can find OpRegion and stolen memory.  Handles the Gen11+
+# 64-bit BDSM at offset 0xC0 — the classic upstream IgdAssignmentDxe
+# does not.
+ENV VFIOIGD_COMMIT 348860da70ca3a9ed6c1d95c30a97c757f54336b
+ADD --keep-git-dir=true https://github.com/tomitamoeko/VfioIgdPkg.git#${VFIOIGD_COMMIT} /edk2/VfioIgdPkg
 
 FROM build-edk2 AS build-arm64
 
@@ -63,7 +71,8 @@ COPY build.sh /edk2/
 RUN ./build.sh
 
 # create an out dir for all the artifacts
-RUN rm -rf /out && mkdir /out && cp /edk2/OVMF*.fd /out
+RUN rm -rf /out && mkdir /out && cp /edk2/OVMF*.fd /out && \
+    if [ -f /edk2/igd.rom ]; then cp /edk2/igd.rom /out/; fi
 
 # some architecture specific cases. There probably is a cleaner dockerfile-native way to do this.
 RUN case $(uname -m) in \

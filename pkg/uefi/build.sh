@@ -33,6 +33,15 @@ case $(uname -m) in
              cp Build/OvmfX64/${TARGET}_*/FV/OVMF*.fd .
              build -b ${TARGET} -t GCC5 -a X64 -n "$(nproc)" -p OvmfPkg/OvmfXen.dsc
              cp Build/OvmfXen/${TARGET}_*/FV/OVMF.fd OVMF_PVH.fd
+             # Build VfioIgdPkg open-source IGD option-ROM (IgdAssignmentDxe).
+             # Wrap as a multi-image PCI option-ROM with EfiRom.  PCIR
+             # vendor 0x8086, device 0xffff (wildcard — applies to any
+             # Intel iGPU; the per-device match is done by IgdAssignmentDxe
+             # itself based on PCI class + vendor).
+             build -b ${TARGET} -t GCC5 -a X64 -n "$(nproc)" -p VfioIgdPkg/VfioIgdPkg.dsc
+             EfiRom -f 0x8086 -i 0xffff \
+                 -e Build/VfioIgdPkg/${TARGET}_GCC5/X64/IgdAssignmentDxe.efi \
+                 -o igd.rom
              ;;
           *) echo "Unsupported architecture $(uname). Bailing."
              exit 1
