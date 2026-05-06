@@ -17,6 +17,7 @@ ENV BUILD_PKGS_arm64 iasl
 RUN eve-alpine-deploy.sh
 
 COPY edk2-patches /edk2-patches
+COPY vfioigd-patches /vfioigd-patches
 
 FROM build AS build-arm64-versions
 
@@ -52,6 +53,14 @@ FROM build-edk2 AS build-amd64
 # does not.
 ENV VFIOIGD_COMMIT 348860da70ca3a9ed6c1d95c30a97c757f54336b
 ADD --keep-git-dir=true https://github.com/tomitamoeko/VfioIgdPkg.git#${VFIOIGD_COMMIT} /edk2/VfioIgdPkg
+
+# Apply local VfioIgdPkg patches from pkg/uefi/vfioigd-patches/.  Used
+# to work around toolchain regressions until upstream picks the fixes up.
+RUN set -e ; [ ! -d /edk2/VfioIgdPkg ] || [ ! -d /vfioigd-patches ] || \
+        for patch in /vfioigd-patches/*.patch; do \
+            echo "Applying $patch"; \
+            git -C /edk2/VfioIgdPkg apply -p1 < "$patch" || exit 1 ; \
+        done
 
 FROM build-edk2 AS build-arm64
 

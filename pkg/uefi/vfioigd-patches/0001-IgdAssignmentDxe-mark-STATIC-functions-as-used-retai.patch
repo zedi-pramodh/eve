@@ -1,0 +1,151 @@
+From 766b9d22460f0d0d92fbaac8192b0e54b15ee5bc Mon Sep 17 00:00:00 2001
+From: Mikhail Malyshev <mike.malyshev@gmail.com>
+Date: Wed, 6 May 2026 14:22:52 +0000
+Subject: [PATCH] IgdAssignmentDxe: mark STATIC functions as ((used,retain))
+ for gcc-14 LTO
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+The IgdAssignmentDxe driver registers PciIoNotify (and via it,
+SetupOpRegion / SetupStolenMemory / InitPciInfo / GetPciName /
+Allocate32BitAlignedPagesWithType) as protocol-notify callbacks
+through gBS->CreateEvent + gBS->RegisterProtocolNotify.  The actual
+call site is dispatched at runtime through the EFI System Table's
+function-pointer fields, which LTO cannot trace at link time.
+
+Under gcc-14 (Alpine 3.22, GCC 14.2.0) LTO + --gc-sections is
+aggressive enough to consider these STATIC helpers unreachable
+and strip them from the linked .efi.  The resulting
+IgdAssignmentDxe.efi shrinks from ~27 KB to ~9.6 KB and contains
+no working code path for ASLS / BDSM / OpRegion programming.
+
+When wrapped by EfiRom into the iGPU passthrough option-ROM and
+used by qemu's `vfio-pci ... romfile=igd.rom`, the broken driver
+fails to set up display state correctly.  On Display 13 (RPL-P /
+ADL-P) the result is first-boot scanout corruption that only a
+guest sleep/wake cycle (which forces a full hardware reinit)
+clears.  Earlier gcc-11 (Alpine 3.16) LTO was conservative
+enough to keep the code, masking the issue.
+
+The minimal fix is to mark the STATIC functions in IgdAssignment.c
+and IgdPrivate.c with `__attribute__((used,retain))` so they
+survive both LTO's dead-code elimination and the linker's
+--gc-sections pass.  `((retain))` requires gcc ≥ 11 — available
+in every toolchain we still target.
+
+STATIC variables / arrays declared on single lines (the per-
+generation IGD_PRIVATE_DATA tables in IgdPrivate.c) are not
+touched; they remain reachable transitively through the retained
+helper functions.
+
+No functional change for builds where LTO already kept these
+symbols (e.g. gcc-11 era).
+
+Signed-off-by: Mikhail Malyshev <mike.malyshev@gmail.com>
+---
+ IgdAssignmentDxe/IgdAssignment.c | 12 ++++++------
+ IgdAssignmentDxe/IgdPrivate.c    |  8 ++++----
+ 2 files changed, 10 insertions(+), 10 deletions(-)
+
+diff --git a/IgdAssignmentDxe/IgdAssignment.c b/IgdAssignmentDxe/IgdAssignment.c
+index d1214e8..da62cd0 100644
+--- a/IgdAssignmentDxe/IgdAssignment.c
++++ b/IgdAssignmentDxe/IgdAssignment.c
+@@ -68,7 +68,7 @@ STATIC VOID                 *mPciIoTracker;
+                        PciIo->GetLocation(). The contents of PciInfo are
+                        indeterminate.
+ **/
+-STATIC
++STATIC __attribute__((used,retain))
+ EFI_STATUS
+ InitPciInfo (
+   IN  EFI_PCI_IO_PROTOCOL *PciIo,
+@@ -136,7 +136,7 @@ InitPciInfo (
+   @return                PciInfo->Name
+ **/
+ #if !defined(MDEPKG_NDEBUG)
+-STATIC
++STATIC __attribute__((used,retain))
+ CONST CHAR8 *
+ GetPciName (
+   IN OUT CANDIDATE_PCI_INFO *PciInfo
+@@ -182,7 +182,7 @@ GetPciName (
+ 
+   @return                        Error codes from gBS->AllocatePages().
+ **/
+-STATIC
++STATIC __attribute__((used,retain))
+ EFI_STATUS
+ Allocate32BitAlignedPagesWithType (
+   IN  EFI_MEMORY_TYPE      MemoryType,
+@@ -275,7 +275,7 @@ Allocate32BitAlignedPagesWithType (
+   @return                        Error codes propagated from underlying
+                                  functions.
+ **/
+-STATIC
++STATIC __attribute__((used,retain))
+ EFI_STATUS
+ SetupOpRegion (
+   IN     EFI_PCI_IO_PROTOCOL *PciIo,
+@@ -366,7 +366,7 @@ FreeOpRegion:
+   @return                        Error codes propagated from underlying
+                                  functions.
+ **/
+-STATIC
++STATIC __attribute__((used,retain))
+ EFI_STATUS
+ SetupStolenMemory (
+   IN     EFI_PCI_IO_PROTOCOL *PciIo,
+@@ -445,7 +445,7 @@ FreeStolenMemory:
+ 
+   @param[in] Context  The pointer to the notification function's context.
+ **/
+-STATIC
++STATIC __attribute__((used,retain))
+ VOID
+ EFIAPI
+ PciIoNotify (
+diff --git a/IgdAssignmentDxe/IgdPrivate.c b/IgdAssignmentDxe/IgdPrivate.c
+index ee4493b..9bc339f 100644
+--- a/IgdAssignmentDxe/IgdPrivate.c
++++ b/IgdAssignmentDxe/IgdPrivate.c
+@@ -34,7 +34,7 @@ typedef struct {
+ #define    BDW_GMCH_GMS_SHIFT   8
+ #define    BDW_GMCH_GMS_MASK    0xff
+ 
+-STATIC
++STATIC __attribute__((used,retain))
+ UINTN
+ Gen6StolenSize (
+   IN EFI_PCI_IO_PROTOCOL *PciIo
+@@ -49,7 +49,7 @@ Gen6StolenSize (
+   return Gms * SIZE_32MB;
+ }
+ 
+-STATIC
++STATIC __attribute__((used,retain))
+ UINTN
+ Gen8StolenSize (
+   IN EFI_PCI_IO_PROTOCOL *PciIo
+@@ -64,7 +64,7 @@ Gen8StolenSize (
+   return Gms * SIZE_32MB;
+ }
+ 
+-STATIC
++STATIC __attribute__((used,retain))
+ UINTN
+ ChvStolenSize (
+   IN EFI_PCI_IO_PROTOCOL *PciIo
+@@ -90,7 +90,7 @@ ChvStolenSize (
+   }   
+ }
+ 
+-STATIC
++STATIC __attribute__((used,retain))
+ UINTN
+ Gen9StolenSize (
+   IN EFI_PCI_IO_PROTOCOL *PciIo
+-- 
+2.43.0
+
