@@ -218,6 +218,37 @@ Note: `DEBUG()` macros are compiled out in a `TARGET=RELEASE` OVMF build
 `debug.enable.efi=true` on a RELEASE OVMF creates the log file but it will
 be empty. A `TARGET=DEBUG` OVMF rebuild is required for useful output.
 
+### Dumping the iGPU OpRegion for off-line analysis
+
+QEMU's vfio-igd quirk in EVE is patched to write a copy of the host iGPU's
+OpRegion to a per-domain file each time `x-igd-opregion=on` populates
+`etc/igd-opregion` for the guest:
+
+```
+/run/hypervisor/kvm/<qemu-vm-name>/igd-opregion.bin
+```
+
+(see `pkg/xen-tools/patches-4.19.0/x86_64/12-vfio-igd-opregion-dump.patch`).
+QEMU also logs a one-line `IGD: OpRegion dumped to <path> (<N> bytes,
+magic="IntelGraphicsMem")` to its stderr, which makes it into the EVE
+device log via the `guest_vm_err` channel. The file is the same bytes
+that are passed to the guest through fw_cfg, so what the guest's IGD
+driver reads is exactly what's on disk.
+
+`tools/igpu-vbt-dump.py` is a stand-alone Python decoder for these dumps:
+
+```
+$ scp root@<edge>:/run/hypervisor/kvm/<vm>/igd-opregion.bin .
+$ tools/igpu-vbt-dump.py igd-opregion.bin
+```
+
+It prints the OpRegion header (magic, version, mailbox flags, BIOS /
+driver version strings), the embedded VBT header (signature, version,
+BDB offset), and the BDB block list with recognised names. Useful for
+side-by-side comparison across host platforms (e.g. TGL vs RPL-P) when
+diagnosing GOP / connector init differences. Multiple dumps can be passed
+in one invocation; the decoder is read-only.
+
 ---
 
 ## Supported Intel GPU generations
