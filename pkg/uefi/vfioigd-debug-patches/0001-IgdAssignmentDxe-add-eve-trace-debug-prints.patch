@@ -1,0 +1,69 @@
+diff --git a/IgdAssignmentDxe/IgdAssignment.c b/IgdAssignmentDxe/IgdAssignment.c
+index da62cd0..12c0ca4 100644
+--- a/IgdAssignmentDxe/IgdAssignment.c
++++ b/IgdAssignmentDxe/IgdAssignment.c
+@@ -334,7 +334,7 @@ SetupOpRegion (
+     goto FreeOpRegion;
+   }
+ 
+-  DEBUG ((DEBUG_INFO, "%a: %a: OpRegion @ 0x%Lx size 0x%Lx version %d.%d.%d\n",
++  DEBUG ((DEBUG_ERROR, "%a: %a: OpRegion @ 0x%Lx size 0x%Lx version %d.%d.%d\n",
+     __FUNCTION__,
+     GetPciName (PciInfo), Address, (UINT64)mOpRegionSize,
+     ((IGD_OPREGION_HEADER*)BytePointer)->OVER >> 24,
+@@ -427,7 +427,7 @@ SetupStolenMemory (
+     goto FreeStolenMemory;
+   }
+ 
+-  DEBUG ((DEBUG_INFO, "%a: %a: stolen memory @ 0x%Lx, size %d MB\n",
++  DEBUG ((DEBUG_ERROR, "%a: %a: stolen memory @ 0x%Lx, size %d MB\n",
+     __FUNCTION__, GetPciName (PciInfo), Address, Size / SIZE_1MB));
+   return EFI_SUCCESS;
+ 
+@@ -455,6 +455,8 @@ PciIoNotify (
+ {
+   EFI_PCI_IO_PROTOCOL *PciIo;
+ 
++  DEBUG ((DEBUG_ERROR, "%a: ENTRY (eve-trace)\n", __FUNCTION__));
++
+   while (!EFI_ERROR (gBS->LocateProtocol (
+                             &gEfiPciIoProtocolGuid,
+                             mPciIoTracker,
+@@ -470,6 +472,13 @@ PciIoNotify (
+       continue;
+     }
+ 
++    DEBUG ((DEBUG_ERROR,
++      "%a: candidate %04x:%04x class=%02x:%02x:%02x bdf=%04x:%02x:%02x.%x (eve-trace)\n",
++      __FUNCTION__, PciInfo.VendorId, PciInfo.DeviceId,
++      PciInfo.ClassCode[2], PciInfo.ClassCode[1], PciInfo.ClassCode[0],
++      (UINT16)PciInfo.Segment, (UINT8)PciInfo.Bus, (UINT8)PciInfo.Device,
++      (UINT32)PciInfo.Function & 0xf));
++
+     //
+     // Check VendorId and ClassCode. These checks are necessary for both
+     // OpRegion and stolen memory setup.
+@@ -538,16 +547,23 @@ IgdAssignmentEntry (
+   EFI_STATUS           Status;
+   EFI_EVENT            PciIoEvent;
+ 
++  DEBUG ((DEBUG_ERROR, "%a: ENTRY (eve-trace)\n", __FUNCTION__));
++
+   OpRegionStatus = QemuFwCfgFindFile (
+                      ASSIGNED_IGD_FW_CFG_OPREGION,
+                      &mOpRegionItem,
+                      &mOpRegionSize
+                      );
+ 
++  DEBUG ((DEBUG_ERROR, "%a: QemuFwCfgFindFile(%a)=%r mOpRegionSize=0x%Lx (eve-trace)\n",
++    __FUNCTION__, ASSIGNED_IGD_FW_CFG_OPREGION, OpRegionStatus, (UINT64)mOpRegionSize));
++
+   //
+   // If neither fw_cfg file is available, assume no IGD is assigned.
+   //
+   if (EFI_ERROR (OpRegionStatus)) {
++    DEBUG ((DEBUG_ERROR, "%a: returning EFI_UNSUPPORTED — no etc/igd-opregion in fw_cfg (eve-trace)\n",
++      __FUNCTION__));
+     return EFI_UNSUPPORTED;
+   }
+ 

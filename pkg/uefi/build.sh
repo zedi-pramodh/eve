@@ -1,5 +1,8 @@
 #!/bin/bash
 
+# Flip to DEBUG to layer the VfioIgdPkg diagnostic patches under
+# /vfioigd-debug-patches/ + the matching DSC PCD/HobLib mods below.
+# RELEASE skips both.
 TARGET=RELEASE
 
 # Debug knob: override OVMF's PcdPlatformBootTimeOut (in seconds).
@@ -57,6 +60,47 @@ case $(uname -m) in
              cp Build/OvmfX64/${TARGET}_*/FV/OVMF*.fd .
              build -b ${TARGET} -t GCC5 -a X64 -n "$(nproc)" -p OvmfPkg/OvmfXen.dsc
              cp Build/OvmfXen/${TARGET}_*/FV/OVMF.fd OVMF_PVH.fd
+             # When UEFI_TARGET=DEBUG: layer the diagnostic patches and
+             # adjust the VfioIgdPkg DSC.  RELEASE builds skip this
+             # entire block so production images carry no trace code.
+             #
+             # The DSC mods are:
+             #   - PcdDebugPropertyMask=0x0F   PRINT + ASSERT + CODE +
+             #                                  CLEAR_MEMORY enabled, but
+             #                                  NOT ASSERT_DEADLOOP — so
+             #                                  asserts print and continue
+             #                                  rather than halting the
+             #                                  DXE phase (BaseHobLibNull
+             #                                  asserts on every call;
+             #                                  HobLib swap below makes
+             #                                  most of those go away,
+             #                                  but anything else that
+             #                                  asserts shouldn't brick
+             #                                  the boot).
+             #   - PcdFixedDebugPrintErrorLevel=0x804F004F   matches what
+             #                                  OvmfPkg uses for its own
+             #                                  DEBUG builds.
+             #   - HobLib swap: replace BaseHobLibNull (a stub where every
+             #                  call ASSERTs) with the real DxeHobLib so
+             #                  QemuFwCfgDxeLib's HOB lookups work.
+             #                  Pulls in UefiLib + DevicePathLib.
+             #
+             # All sed mods are guarded by grep so reruns are idempotent.
+             if [ "${TARGET}" = "DEBUG" ] && [ -d /vfioigd-debug-patches ] ; then
+                 for patch in /vfioigd-debug-patches/*.patch ; do
+                     echo "Applying $patch (DEBUG-only)"
+                     git -C /edk2/VfioIgdPkg apply -p1 < "$patch" || exit 1
+                 done
+                 if ! grep -q PcdFixedDebugPrintErrorLevel VfioIgdPkg/VfioIgdPkg.dsc ; then
+                     sed -i 's#^\[Components\]#[PcdsFixedAtBuild]\n  gEfiMdePkgTokenSpaceGuid.PcdDebugPropertyMask|0x0F\n  gEfiMdePkgTokenSpaceGuid.PcdFixedDebugPrintErrorLevel|0x804F004F\n\n[Components]#' VfioIgdPkg/VfioIgdPkg.dsc
+                 fi
+                 if grep -q 'HobLib|MdeModulePkg/Library/BaseHobLibNull/BaseHobLibNull.inf' VfioIgdPkg/VfioIgdPkg.dsc ; then
+                     sed -i 's#^\(\s*HobLib\)|MdeModulePkg/Library/BaseHobLibNull/BaseHobLibNull.inf#\1|MdePkg/Library/DxeHobLib/DxeHobLib.inf\n  UefiLib|MdePkg/Library/UefiLib/UefiLib.inf\n  DevicePathLib|MdePkg/Library/UefiDevicePathLib/UefiDevicePathLib.inf#' VfioIgdPkg/VfioIgdPkg.dsc
+                 fi
+                 echo "VfioIgdPkg DEBUG mods applied:"
+                 grep -E 'HobLib|UefiLib|DevicePathLib|PcdsFixedAtBuild|PcdDebugPropertyMask' VfioIgdPkg/VfioIgdPkg.dsc | head
+             fi
+
              # Build VfioIgdPkg open-source IGD option-ROM (IgdAssignmentDxe).
              # Wrap as a multi-image PCI option-ROM with EfiRom.  PCIR
              # vendor 0x8086, device 0xffff (wildcard — applies to any

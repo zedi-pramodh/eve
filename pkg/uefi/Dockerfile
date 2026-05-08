@@ -18,6 +18,7 @@ RUN eve-alpine-deploy.sh
 
 COPY edk2-patches /edk2-patches
 COPY vfioigd-patches /vfioigd-patches
+COPY vfioigd-debug-patches /vfioigd-debug-patches
 
 FROM build AS build-arm64-versions
 
@@ -54,8 +55,14 @@ FROM build-edk2 AS build-amd64
 ENV VFIOIGD_COMMIT 348860da70ca3a9ed6c1d95c30a97c757f54336b
 ADD --keep-git-dir=true https://github.com/tomitamoeko/VfioIgdPkg.git#${VFIOIGD_COMMIT} /edk2/VfioIgdPkg
 
-# Apply local VfioIgdPkg patches from pkg/uefi/vfioigd-patches/.  Used
-# to work around toolchain regressions until upstream picks the fixes up.
+# VfioIgdPkg patches:
+#   /vfioigd-patches/        — always applied (toolchain regressions etc.)
+#   /vfioigd-debug-patches/  — applied by build.sh only when UEFI_TARGET=DEBUG
+#
+# The always-on set is applied here at image-build time so the unpatched
+# upstream tree never ships in the runtime layer.  The debug-only set is
+# left to build.sh, which conditionalises both the patch apply and the
+# matching VfioIgdPkg.dsc PCD/HobLib mods on UEFI_TARGET=DEBUG.
 RUN set -e ; [ ! -d /edk2/VfioIgdPkg ] || [ ! -d /vfioigd-patches ] || \
         for patch in /vfioigd-patches/*.patch; do \
             echo "Applying $patch"; \
