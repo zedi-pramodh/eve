@@ -166,6 +166,7 @@ emulated guest PA.  The driver sees conflicting values and crashes.  This was th
 critical missing piece for Tiger Lake and other Gen11+ devices.
 
 Based on upstream QEMU commits:
+
 - [`11b5ce95`](https://github.com/qemu/qemu/commit/11b5ce95beecfd51d1b17858d23fe9cbb0b5783f)
   "vfio/igd: add new bar0 quirk to emulate BDSM mirror" by Corvin Köhne
 - [`f926baa0`](https://github.com/qemu/qemu/commit/f926baa03b7babb8291ea4c1cbeadaf224977dae)
@@ -189,7 +190,7 @@ Based on upstream QEMU commits:
 
 Pre-OS display requires `IntelGopDriver.efi`, the proprietary Intel GOP driver from the
 host platform firmware. EVE's design does not depend on pre-OS display. If pre-OS display
-is needed, place the proprietary GOP ROM under `/persist/gop/` on the device and set the
+is needed, place the proprietary GOP ROM under `/persist/vault/gop/` on the device and set the
 global config item `igpu.gop` to its basename. EVE uses only the
 configured filename (no directory traversal, no auto-discovery by device ID). When the
 config is empty or the file is missing, EVE falls back to the bundled `igd.rom`.
@@ -203,6 +204,47 @@ not produce a framebuffer: `IgdAssignmentDxe` is required to set BDSM and
 `PlatformGopPolicy` is required for `IntelGopDriver`'s init protocol. Verify a
 ROM with `EfiRom -d <rom>` — expect three `Image` entries, with the last one
 having `Indicator 0x80`.
+
+### Spoofing the LPC bridge device ID for proprietary GOP
+
+`IntelGopDriver.efi` from real platform firmware checks the LPC bridge at
+`00:1f.0` against an internal whitelist of host-PCH device IDs and refuses
+to bind unless one matches. q35 emulates the LPC bridge as a generic
+`ICH9-LPC` (device ID `0x2918`), which is on no real-platform whitelist —
+so the OEM GOP loads but silently declines to drive the iGPU and there's
+no pre-OS framebuffer.
+
+EVE works around this by patching QEMU's `ICH9-LPC` to expose an
+`x-device-id` property
+(`pkg/xen-tools/patches-4.19.0/x86_64/13-lpc-ich9-x-device-id.patch`) and
+threading the property value through pillar's KVM hypervisor template
+(`-global ICH9-LPC.x-device-id=<value>`), which makes the spoofed PCH
+device ID visible to `IntelGopDriver`'s whitelist check.
+
+The spoof is opt-in per-platform via a small JSON file at
+`/persist/vault/gop/id.json`:
+
+```json
+{ "lpc_device_id": "0xa082" }
+```
+
+The value is the PCH device ID the proprietary GOP expects for the
+target platform — typically the LPC device ID of the real host system
+the proprietary ROM was extracted from. For Tiger Lake-UP3 (where ALL
+the LongQT-sea releases above are tested) `0xa082` is the canonical
+choice; for other platforms inspect the host's real LPC bridge with
+`lspci -nn -s 00:1f.0` on a working bare-metal install of the
+corresponding hardware.
+
+Important: the spoof is **only** applied when EVE detects a usable
+proprietary GOP ROM (i.e. `igpu.gop` names a file that exists in
+`/persist/vault/gop/`). On the open-source path (the bundled `igd.rom`,
+which contains `IgdAssignmentDxe` only and no whitelist check), the
+spoof is skipped — applying it has been observed to break the
+Windows display driver on Raptor Lake-P because it changes which
+ACPI / power-management quirk table the OS picks. If you switch from
+the proprietary path back to OSS, also remove or empty
+`id.json`.
 
 ### Capturing OVMF/EDK2 debug output
 
@@ -224,7 +266,7 @@ QEMU's vfio-igd quirk in EVE is patched to write a copy of the host iGPU's
 OpRegion to a per-domain file each time `x-igd-opregion=on` populates
 `etc/igd-opregion` for the guest:
 
-```
+```text
 /run/hypervisor/kvm/<qemu-vm-name>/igd-opregion.bin
 ```
 
@@ -237,7 +279,7 @@ driver reads is exactly what's on disk.
 
 `tools/igpu-vbt-dump.py` is a stand-alone Python decoder for these dumps:
 
-```
+```sh
 $ scp root@<edge>:/run/hypervisor/kvm/<vm>/igd-opregion.bin .
 $ tools/igpu-vbt-dump.py igd-opregion.bin
 ```
