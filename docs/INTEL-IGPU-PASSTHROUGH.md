@@ -194,6 +194,30 @@ global config item `igpu.gop` to its basename. EVE uses only the
 configured filename (no directory traversal, no auto-discovery by device ID). When the
 config is empty or the file is missing, EVE falls back to the bundled `igd.rom`.
 
+A well-formed proprietary GOP ROM is a PCI Option ROM with three EFI images inside
+— `IgdAssignmentDxe`, `PlatformGopPolicy`, and `IntelGopDriver` — in that order.
+Pre-built per-generation ROMs are published at
+[LongQT-sea/intel-igpu-passthru/releases](https://github.com/LongQT-sea/intel-igpu-passthru/releases/)
+and are the recommended source for testing. A GOP-only ROM (single image) will
+not produce a framebuffer: `IgdAssignmentDxe` is required to set BDSM and
+`PlatformGopPolicy` is required for `IntelGopDriver`'s init protocol. Verify a
+ROM with `EfiRom -d <rom>` — expect three `Image` entries, with the last one
+having `Indicator 0x80`.
+
+### Capturing OVMF/EDK2 debug output
+
+The boolean global config item `debug.enable.efi` wires an `isa-debugcon`
+device at I/O port 0x402 to each KVM guest, writing OVMF/EDK2 `DEBUG()`
+output to `/run/hypervisor/kvm/<domain>/efi-debug.log`. This is the primary
+diagnostic for diagnosing proprietary GOP failures: which DXE drivers
+loaded, what protocols they published, whether the GOP handle made it into
+`ConOut`.
+
+Note: `DEBUG()` macros are compiled out in a `TARGET=RELEASE` OVMF build
+(EVE's current default in `pkg/uefi/build.sh`). Running with
+`debug.enable.efi=true` on a RELEASE OVMF creates the log file but it will
+be empty. A `TARGET=DEBUG` OVMF rebuild is required for useful output.
+
 ---
 
 ## Supported Intel GPU generations
