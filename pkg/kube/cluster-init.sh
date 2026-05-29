@@ -485,6 +485,10 @@ check_start_containerd() {
                 ln -s /var/lib/rancher/k3s/data/current/bin/containerd-shim-runc-v2 /usr/bin/containerd-shim-runc-v2
         fi
 
+        # pgrep on the full binary path is witness-safe because pkg/witness
+        # exec's its containerd from /var/lib/witness/bin/containerd (a
+        # witness-private symlink), NOT from this k3s data path. If you
+        # ever rename the witness's binary path, keep the two divergent.
         pgrep -f "/var/lib/rancher/k3s/data/current/bin/containerd" > /dev/null 2>&1
         if [ $? -eq 1 ]; then
                 mkdir -p /run/containerd-user

@@ -44,3 +44,12 @@ WITNESS_CTRD_SOCK="/run/witness/containerd/containerd.sock"
 WITNESS_CTRD_CONFIG="/etc/witness/containerd-config.toml"
 # shellcheck disable=SC2034
 WITNESS_CTRD_LOG="/persist/kubelog/witness-containerd.log"
+# Witness-private containerd binary path (a symlink to the k3s-shipped
+# /var/lib/rancher/k3s/data/current/bin/containerd, created at startup).
+# Using a witness-unique path is what keeps pkg/kube's pgrep-on-binary-path
+# from matching our containerd in the shared host PID namespace. /var/lib
+# is bind-mounted to /persist/vault/witness so the symlink survives reboots.
+# shellcheck disable=SC2034
+WITNESS_CTRD_BIN_DIR="/var/lib/witness/bin"
+# shellcheck disable=SC2034
+WITNESS_CTRD_BIN="${WITNESS_CTRD_BIN_DIR}/containerd"

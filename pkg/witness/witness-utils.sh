@@ -170,20 +170,35 @@ check_start_containerd() {
                /usr/bin/containerd-shim-runc-v2
     fi
 
-    # Already running? The config path is a witness-unique substring of the
-    # containerd cmdline, so pgrep won't match pkg/kube's containerd.
-    if pgrep -f "$WITNESS_CTRD_CONFIG" > /dev/null 2>&1; then
+    # Exec containerd from a witness-private path so /proc/<pid>/cmdline
+    # is *visibly* the witness's, not pkg/kube's. Both packages would
+    # otherwise share the path string "/var/lib/rancher/k3s/data/current/bin
+    # /containerd" (each has its own /var/lib bind, but the in-container
+    # path is the same), and any pgrep on that string in pkg/kube would
+    # falsely match the witness's containerd — silently suppressing
+    # pkg/kube's "containerd died, restart it" supervisor. We park a
+    # symlink under /var/lib/witness/bin/ (persistent: /var/lib is bound
+    # to /persist/vault/witness) and exec from there.
+    mkdir -p "$WITNESS_CTRD_BIN_DIR"
+    if [ ! -L "$WITNESS_CTRD_BIN" ] && \
+       [ -x /var/lib/rancher/k3s/data/current/bin/containerd ]; then
+        ln -sf /var/lib/rancher/k3s/data/current/bin/containerd "$WITNESS_CTRD_BIN"
+    fi
+
+    # Already running? The binary path itself is now witness-unique, so a
+    # straight pgrep on $WITNESS_CTRD_BIN cannot match pkg/kube's containerd.
+    if pgrep -f "$WITNESS_CTRD_BIN" > /dev/null 2>&1; then
         return 0
     fi
 
-    if [ ! -x /var/lib/rancher/k3s/data/current/bin/containerd ]; then
-        logmsg "containerd binary not yet extracted under /var/lib/rancher/k3s/data — waiting"
+    if [ ! -x "$WITNESS_CTRD_BIN" ]; then
+        logmsg "witness containerd binary not yet linked at $WITNESS_CTRD_BIN — waiting"
         return 1
     fi
 
     mkdir -p /run/witness/containerd /var/lib/witness-containerd
     logmsg "Starting witness-private containerd (socket=$WITNESS_CTRD_SOCK)"
-    nohup /var/lib/rancher/k3s/data/current/bin/containerd \
+    nohup "$WITNESS_CTRD_BIN" \
           --config "$WITNESS_CTRD_CONFIG" \
           >> "$WITNESS_CTRD_LOG" 2>&1 &
     ctrd_pid=$!
@@ -194,6 +209,13 @@ check_start_containerd() {
 # Returns 0 if the witness's own k3s server is alive, 1 otherwise. Reads
 # the PID we wrote at launch time and validates it's still a k3s process
 # (defends against PID reuse).
+#
+# Zombie handling: witness-init.sh launches k3s with `nohup ... &` and never
+# calls `wait`, so when k3s exits the child sits as a zombie in our process
+# table. For a zombie, `kill -0` still succeeds and `/proc/$pid/comm` still
+# reads "k3s" — so without the explicit state check below we'd report the
+# dead k3s as running and never restart it. Field 3 of /proc/$pid/stat is
+# the process state; "Z" means zombie.
 is_witness_k3s_running() {
     [ -r "$WITNESS_K3S_PID_FILE" ] || return 1
     pid=$(cat "$WITNESS_K3S_PID_FILE" 2>/dev/null)
@@ -201,9 +223,22 @@ is_witness_k3s_running() {
     kill -0 "$pid" 2>/dev/null || return 1
     [ -r "/proc/$pid/comm" ] || return 1
     case "$(cat /proc/$pid/comm 2>/dev/null)" in
-        k3s*) return 0 ;;
-        *)    return 1 ;;
+        k3s*) ;;
+        *) return 1 ;;
     esac
+    # Reject zombies — read state from /proc/$pid/stat (field after the
+    # parenthesised comm). Reap the zombie while we're here so it doesn't
+    # accumulate across restart loops.
+    # /proc/$pid/stat is "pid (comm) state ...". comm can contain spaces and
+    # parens, so we scan backwards for the last field that ENDS in ")" — the
+    # state is the field immediately after it.
+    state=$(awk '{ for (i=NF;i>=1;i--) if ($i ~ /\)$/) { print $(i+1); exit } }' \
+            "/proc/$pid/stat" 2>/dev/null)
+    if [ "$state" = "Z" ]; then
+        wait "$pid" 2>/dev/null || true
+        return 1
+    fi
+    return 0
 }
 
 # Terminate ONLY our k3s — read the PID file, signal that PID. Never use

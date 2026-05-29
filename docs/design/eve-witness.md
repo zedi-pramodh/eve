@@ -594,6 +594,47 @@ shift the port via the specific agent flag (`lb-server-port`), not via
 `supervisor-port` or `https-listen-port` (those control the *server*
 listener, not the agent's LB).
 
+### Witness containerd MUST exec from a witness-unique path
+
+**Symptom:** pkg/kube's k3s server is up, `kubectl get nodes` works, but
+the node goes NotReady. `kubectl describe node` shows kubelet stopped
+posting status. `tail /persist/kubelog/k3s.log` (pkg/kube side) shows an
+endless loop:
+
+```
+Waiting for CRI startup: rpc error: code = Unavailable …
+dial unix /run/containerd-user/containerd.sock: connect: no such file or directory
+```
+
+The `/run/containerd-user/containerd.sock` doesn't exist — pkg/kube's
+standalone containerd has died and has NOT been restarted by pkg/kube's
+own supervisor (`check_start_containerd` in cluster-init.sh), which uses
+`pgrep -f "/var/lib/rancher/k3s/data/current/bin/containerd"` as its
+liveness test.
+
+**Cause:** the witness's `check_start_containerd` was exec'ing containerd
+from the *exact same path string* — `/var/lib/rancher/k3s/data/current/bin/containerd`.
+Each container has its own `/var/lib` (witness's is bound to
+`/persist/vault/witness`), so the binary on disk is different, but the
+**path string in `/proc/<pid>/cmdline` is identical**. In the shared host
+PID namespace pkg/kube's pgrep matches the witness's containerd as if it
+were its own, concludes "containerd is fine", and never restarts the dead
+pkg/kube containerd. k3s then sits forever on CRI dial.
+
+**Fix:** exec the witness's containerd from a witness-unique path. We
+symlink `/var/lib/witness/bin/containerd` → the k3s-shipped binary and
+exec from the symlink (`WITNESS_CTRD_BIN` in `lib/config.sh`). The
+`/proc/<pid>/cmdline` then visibly identifies the witness's containerd,
+and pkg/kube's existing `pgrep -f "/var/lib/rancher/k3s/data/current/bin
+/containerd"` no longer matches it.
+
+**Rule (general):** any binary the witness exec's from a path shared with
+pkg/kube (k3s itself, containerd, future helpers) needs a witness-unique
+in-container path. k3s strips its argv so we use a PID file (§4.1);
+containerd doesn't strip argv, so a witness-unique exec path is enough.
+Do **not** rely on `--config` or other flags as the discriminator —
+they're easier to overlook when adding new pgrep callsites in pkg/kube.
+
 ### State persistence map (which paths survive what)
 
 | Path in container | Backed by | Survives container restart? | Survives device reboot? |
