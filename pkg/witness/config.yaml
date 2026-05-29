@@ -1,0 +1,89 @@
+---
+# k3s server config for the EVE-k witness node.
+#
+# Mode: dedicated etcd node (k3s docs-blessed pattern).
+#   - apiserver / controller-manager / scheduler disabled (we do NOT want
+#     two apiservers fighting for hardcoded 127.0.0.1:6444 or for the
+#     controller-manager / scheduler leader lease).
+#   - agent (kubelet) IS enabled — embedded etcd requires kubelet so a
+#     Node object exists to track etcd cluster membership. See the design
+#     doc §8a "etcd-only k3s + --disable-agent is unsupported" gotcha.
+#   - kube-proxy + flannel disabled — witness hosts no pods or services
+#     and we want zero interaction with pkg/kube's iptables and flannel.1.
+#   - Workloads kept off via NoSchedule taint.
+#   - Custom containerd socket so we don't fight pkg/kube for k3s's default
+#     /run/k3s/containerd/containerd.sock.
+#
+# Reserved witness identity (fixed across all EVE-k installs):
+#   node name: eve-witness   (also on the CLI for pgrep disambiguation)
+#   node IP:   10.244.244.244 (lives on dummy iface eve-witness0)
+
+log: "/persist/kubelog/witness.log"
+node-ip: "10.244.244.244"
+
+# Relocate the agent loadbalancer off the default 127.0.0.1:6444.
+#
+# Even with disable-apiserver: true below, the agent (kubelet) stays enabled
+# (embedded etcd requires it — see design doc §8a). The agent always brings
+# up a supervisor loadbalancer on 127.0.0.1, and its bind port is a SEPARATE
+# hardcoded default (6444) — NOT derived from supervisor-port as you might
+# expect. pkg/kube's k3s already owns 127.0.0.1:6444, so the witness's LB
+# has to be moved with the lb-server-port flag explicitly.
+#
+# The accompanying supervisor-port / https-listen-port shifts are belt-and-
+# braces: with disable-apiserver: true the apiserver never actually binds,
+# and supervisor binds on node-ip (10.244.244.244) not 127.0.0.1, so the
+# default 6443 would NOT collide today. But pinning them off-default keeps
+# all witness listen ports in a single contiguous range (6644/6645) — easier
+# to reason about and audit on the seed.
+#
+#   supervisor listen      → 10.244.244.244:6644
+#   apiserver listen       → would-be 10.244.244.244:6644 (disabled below)
+#   agent supervisor LB    → 127.0.0.1:6645  ← the real collision fix
+#
+# Empirically validated 2026-05-28 on k3s v1.34.2+k3s1. Removing
+# lb-server-port re-introduces the 6444 collision.
+https-listen-port: 6644
+supervisor-port: 6644
+lb-server-port: 6645
+
+# Dedicated etcd node — the canonical k3s pattern.
+disable-apiserver: true
+disable-controller-manager: true
+disable-scheduler: true
+
+# Witness has no pods/services. Both of these eliminate big classes of
+# host-shared-resource collisions with pkg/kube:
+#   - kube-proxy would otherwise program iptables for cluster services,
+#     fighting pkg/kube's kube-proxy on the same host iptables.
+#   - flannel would otherwise create flannel.1 VXLAN device, which is
+#     globally named and would collide with pkg/kube's flannel.1.
+disable-kube-proxy: true
+flannel-backend: none
+
+# Use our own containerd at /run/witness/containerd/containerd.sock —
+# witness-init.sh spawns it before launching k3s. pkg/kube uses the
+# equivalent /run/containerd-user/containerd.sock. k3s's embedded
+# containerd at /run/k3s/containerd/containerd.sock is never started
+# because we point kubelet at this external one.
+container-runtime-endpoint: "unix:///run/witness/containerd/containerd.sock"
+
+# Nothing schedules on the witness. The label is nice-to-have for
+# operators; the taint is the actual guard.
+node-label:
+  - "node-role.kubernetes.io/witness=true"
+node-taint:
+  - "node-role.kubernetes.io/witness=true:NoSchedule"
+  # Defence-in-depth — anything with a wildcard toleration would still
+  # be evicted by this stronger NoExecute taint.
+  - "CriticalAddonsOnly=true:NoExecute"
+
+# etcd tuning. URL flags intentionally absent — k3s derives them from
+# node-ip and overriding them breaks bootstrap reconcile (see design doc
+# §8a "Don't override etcd peer/client URLs via etcd-arg").
+etcd-arg:
+  - "quota-backend-bytes=2147483648"
+  - "auto-compaction-mode=periodic"
+  - "auto-compaction-retention=1h"
+  - "snapshot-count=5000"
+etcd-expose-metrics: true

@@ -1,1 +1,1 @@
-.services += [{"name": "kube","image": "KUBE_TAG", "cgroupsPath": "/eve/services/kube", "oomScoreAdj": -999}]
+.services += [{"name": "kube","image": "KUBE_TAG", "cgroupsPath": "/eve/services/kube", "oomScoreAdj": -999},{"name": "witness","image": "WITNESS_TAG", "cgroupsPath": "/eve/services/witness", "oomScoreAdj": -999}]

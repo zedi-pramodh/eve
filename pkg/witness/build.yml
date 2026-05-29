@@ -1,0 +1,25 @@
+#
+# Copyright (c) 2026 Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# pkg/witness — 3rd etcd vote for 2-node HA clusters.
+# Runs alongside pkg/kube on the seed node. Phase 1: boots a standalone
+# single-node k3s server with the fixed name "eve-witness" (no cluster
+# join logic yet — that arrives in phase 2 when we read ENC config).
+org: lfedge
+image: eve-witness
+config:
+  binds:
+    - /lib/modules:/lib/modules
+    - /dev:/dev
+    - /etc/resolv.conf:/etc/resolv.conf
+    - /run:/run
+    - /persist:/persist:rshared,rbind
+    - /sys/fs/cgroup:/sys/fs/cgroup
+  capabilities:
+    - all
+  pid: host
+  rootfsPropagation: shared
+  devices:
+    - path: all
+      type: a

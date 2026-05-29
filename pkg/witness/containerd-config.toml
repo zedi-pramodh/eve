@@ -1,0 +1,53 @@
+#
+# Copyright (c) 2026 Zededa, Inc.
+# SPDX-License-Identifier: Apache-2.0
+#
+# Containerd config for the EVE-k witness.
+#
+# pkg/kube uses /run/containerd-user/containerd.sock for its private
+# containerd. The witness has to use a different socket path and CRI stream
+# port because both packages share the host /run mount and the host network
+# namespace. Anything that collides between the two on /run or on a TCP/UDP
+# port has to be deconflicted here, not at runtime.
+#
+# State and root paths use /var/lib/... which inside the witness container
+# is bind-mounted from /persist/vault/witness — so containerd's overlayfs
+# and metadata persist across reboots.
+
+version = 2
+
+state = "/run/witness/containerd"
+root  = "/var/lib/witness-containerd"
+
+[plugins."io.containerd.internal.v1.opt"]
+  path = "/var/lib/witness-containerd"
+
+[plugins."io.containerd.grpc.v1.cri"]
+  # 10010 is taken by pkg/kube's containerd CRI stream — use 10011 here.
+  stream_server_address = "127.0.0.1"
+  stream_server_port    = "10011"
+  enable_selinux = false
+  enable_unprivileged_ports = true
+  enable_unprivileged_icmp  = true
+  sandbox_image = "rancher/mirrored-pause:3.6"
+
+[plugins."io.containerd.grpc.v1.cri".containerd]
+  snapshotter = "overlayfs"
+  disable_snapshot_annotations = true
+
+[grpc]
+  address = "/run/witness/containerd/containerd.sock"
+
+[plugins."io.containerd.grpc.v1.cri".cni]
+  # No CNI is actually configured on the witness (flannel-backend: none
+  # and the node is tainted NoSchedule). These paths point at the k3s
+  # data dir for completeness so that if a future change schedules a
+  # toleration pod here, the bin lookup at least resolves.
+  bin_dir  = "/var/lib/rancher/k3s/data/current/bin"
+  conf_dir = "/var/lib/rancher/k3s/agent/etc/cni/net.d"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc]
+  runtime_type = "io.containerd.runc.v2"
+
+[plugins."io.containerd.grpc.v1.cri".containerd.runtimes.runc.options]
+  SystemdCgroup = false

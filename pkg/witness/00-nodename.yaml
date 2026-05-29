@@ -1,0 +1,8 @@
+---
+# Witness identity is fixed and reserved by EVE-k. Do NOT change this name
+# at runtime — pkg/kube discovers the third etcd member by exactly this name
+# (and IP 10.244.244.244).
+#
+# Also passed on the k3s CLI so pgrep -f from either container can tell the
+# two k3s processes apart in the shared host PID namespace.
+node-name: eve-witness

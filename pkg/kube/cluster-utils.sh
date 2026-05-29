@@ -16,6 +16,24 @@ K3S_SERVER_CMD="k3s server"
 K3S_STOP_FLAG="/run/kube/k3s-stop"
 # shellcheck disable=SC2034
 K3S_MANUAL_START_FLAG="/run/kube/k3s-start"
+
+# kube_k3s_pids returns the PIDs of pkg/kube's k3s server process, excluding
+# pkg/witness's. Both containers run with pid: host, so a plain
+# `pgrep -f "k3s server"` would also match the witness's k3s — which launches
+# itself with `--node-name eve-witness` to make this disambiguation possible.
+# All pgrep checks for the kube k3s server MUST use this helper, otherwise
+# pkg/kube will mis-detect the witness's process as its own (skipping start)
+# or accidentally send signals to the witness on terminate_k3s.
+kube_k3s_pids() {
+    pgrep_pids=$(pgrep -f "$K3S_SERVER_CMD" 2>/dev/null)
+    [ -z "$pgrep_pids" ] && return 0
+    for pid in $pgrep_pids; do
+        [ -r "/proc/$pid/cmdline" ] || continue
+        if ! tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "eve-witness"; then
+            echo "$pid"
+        fi
+    done
+}
 TIE_BREAKER_NODE_LABEL="tie-breaker-node"
 TIE_BREAKER_NODE_LABEL_SET_VALUE="true"
 TIE_BREAKER_NODE_LABEL_UNSET_VALUE="false"
@@ -198,7 +216,7 @@ check_log_file_size() {
                 # not releasing the file descriptor, so truncate the file may not
                 # take effect. Signal a HUP signal to that.
                 if [ "$1" = "$K3s_LOG_FILE" ]; then
-                        k3s_pids=$(pgrep -f "$K3S_SERVER_CMD")
+                        k3s_pids=$(kube_k3s_pids)
                         if [ -n "$k3s_pids" ]; then
                                 for pid in $k3s_pids; do
                                         kill -HUP "$pid"
@@ -466,8 +484,9 @@ terminate_k3s() {
   attempt=0
 
   while [ $attempt -lt $max_attempts ]; do
-    # Check for any k3s server processes
-    pids=$(pgrep -f "$K3S_SERVER_CMD")
+    # Check for any k3s server processes (excluding pkg/witness — see
+    # kube_k3s_pids comment).
+    pids=$(kube_k3s_pids)
 
     # If no processes found, we're done
     if [ -z "$pids" ]; then
@@ -497,7 +516,7 @@ terminate_k3s() {
   done
 
   # Final check for any remaining processes - just report status
-  final_check=$(pgrep -f "$K3S_SERVER_CMD")
+  final_check=$(kube_k3s_pids)
   if [ -n "$final_check" ]; then
     logmsg "ERROR: Failed to terminate all k3s server processes after $max_attempts attempts. Still running: $final_check"
     return 1
@@ -515,7 +534,7 @@ wait_for_item() {
         filename="/persist/k3s/wait_$1"
         while [ -e "$filename" ]; do
                 k3sproc=""
-                if pgrep -x "$K3S_SERVER_CMD" > /dev/null; then
+                if [ -n "$(kube_k3s_pids)" ]; then
                         k3sproc="k3s server is running"
                 else
                         k3sproc="k3s server is NOT running"

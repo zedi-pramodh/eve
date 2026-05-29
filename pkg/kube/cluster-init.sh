@@ -281,8 +281,8 @@ check_start_k3s() {
         done
   fi
 
-  pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
-  if [ $? -eq 1 ]; then
+  # kube_k3s_pids excludes pkg/witness's k3s process (see cluster-utils.sh).
+  if [ -z "$(kube_k3s_pids)" ]; then
         # Reset backoff if a manual start was requested
         if [ -f "$K3S_MANUAL_START_FLAG" ]; then
                 logmsg "Manual start requested, resetting restart backoff"
@@ -1616,8 +1616,8 @@ else
                     node_count_ready=$(kubectl get "node/${HOSTNAME}" | grep -cw Ready )
                     if [ "$node_count_ready" -ne 1 ]; then
                         sleep 10
-                        pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1
-                        if [ $? -eq 1 ]; then
+                        # kube_k3s_pids excludes pkg/witness's k3s.
+                        if [ -z "$(kube_k3s_pids)" ]; then
                             break
                         fi
                         continue
