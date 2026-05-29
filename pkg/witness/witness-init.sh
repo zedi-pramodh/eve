@@ -72,7 +72,10 @@ setup_prereqs() {
 }
 
 start_k3s_once() {
-    if pgrep -f "$K3S_SERVER_CMD" > /dev/null 2>&1; then
+    # Check via PID file, NOT pgrep. k3s strips its argv shortly after
+    # startup so a cmdline-based pgrep can't reliably distinguish our k3s
+    # from pkg/kube's in the shared host PID namespace.
+    if is_witness_k3s_running; then
         current_wait_time=$INITIAL_WAIT_TIME
         return 0
     fi
@@ -86,20 +89,22 @@ start_k3s_once() {
     # Phase 1: --cluster-init brings up the etcd cluster (this one member,
     # the witness). config.yaml disables apiserver/controller-manager/
     # scheduler/kube-proxy/flannel and applies the NoSchedule taint.
-    #
-    # --node-name on the CLI is intentional duplication with 00-nodename.yaml:
-    # it's the witness-unique marker pgrep relies on to distinguish this
-    # process from pkg/kube's k3s in the shared host PID namespace. Keep
-    # this in lockstep with K3S_SERVER_CMD in witness-utils.sh.
+    # --node-name eve-witness is also in 00-nodename.yaml as the source
+    # of truth; passing it on the CLI is harmless (k3s accepts both) but
+    # is NOT load-bearing for process identification — see PID file dance.
     nohup /usr/bin/k3s server \
         --node-name eve-witness \
         --cluster-init \
         >> "${K3S_LOG_DIR}/${WITNESS_LOG_FILE}" 2>&1 &
     k3s_pid=$!
+    # Write the PID file IMMEDIATELY — that's our only reliable handle on
+    # this process once k3s strips its argv.
+    mkdir -p "$(dirname "$WITNESS_K3S_PID_FILE")"
+    echo "$k3s_pid" > "$WITNESS_K3S_PID_FILE"
     # etcd fsync latency is critical — give the witness's etcd parity with
     # pkg/kube's in IO scheduling.
     ionice -c2 -n0 -p "$k3s_pid" 2>/dev/null || true
-    logmsg "Started k3s server (pid=$k3s_pid) as witness ${WITNESS_NODE_NAME} on ${WITNESS_NODE_IP}"
+    logmsg "Started k3s server (pid=$k3s_pid) as witness ${WITNESS_NODE_NAME} on ${WITNESS_NODE_IP}, pid file: $WITNESS_K3S_PID_FILE"
     return 0
 }
 

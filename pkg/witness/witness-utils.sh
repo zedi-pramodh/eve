@@ -13,12 +13,15 @@
 K3S_VERSION=v1.34.2+k3s1
 # IMPORTANT: pkg/witness and pkg/kube both run with pid: host AND share the
 # host network namespace, so a plain pgrep -f "k3s server" inside either
-# container matches the OTHER container's k3s. We disambiguate by passing
-# --node-name eve-witness explicitly on the witness's command line (it's
-# also in 00-nodename.yaml as the source of truth — the CLI repeat is purely
-# so pgrep can tell us apart from pkg/kube). pkg/kube's k3s never carries
-# this flag, so the grep below is witness-only.
-K3S_SERVER_CMD="k3s server --node-name eve-witness"
+# container matches the OTHER container's k3s. We CANNOT disambiguate by
+# cmdline string: k3s strips its own argv shortly after startup, so any
+# flag we pass (e.g. --node-name) disappears from /proc/<pid>/cmdline.
+# Both sides therefore identify their own k3s via:
+#   - witness: PID file owned by us (/run/witness/k3s.pid)
+#   - pkg/kube: cgroup membership filter (excludes /eve/services/witness)
+# See is_witness_k3s_running() below.
+K3S_SERVER_CMD="k3s server"
+WITNESS_K3S_PID_FILE="/run/witness/k3s.pid"
 K3S_LOG_DIR="/persist/kubelog"
 INSTALL_LOG="${K3S_LOG_DIR}/witness-install.log"
 WITNESS_LOG_FILE="witness.log"
@@ -188,25 +191,39 @@ check_start_containerd() {
     return 0
 }
 
+# Returns 0 if the witness's own k3s server is alive, 1 otherwise. Reads
+# the PID we wrote at launch time and validates it's still a k3s process
+# (defends against PID reuse).
+is_witness_k3s_running() {
+    [ -r "$WITNESS_K3S_PID_FILE" ] || return 1
+    pid=$(cat "$WITNESS_K3S_PID_FILE" 2>/dev/null)
+    [ -n "$pid" ] || return 1
+    kill -0 "$pid" 2>/dev/null || return 1
+    [ -r "/proc/$pid/comm" ] || return 1
+    case "$(cat /proc/$pid/comm 2>/dev/null)" in
+        k3s*) return 0 ;;
+        *)    return 1 ;;
+    esac
+}
+
+# Terminate ONLY our k3s — read the PID file, signal that PID. Never use
+# pgrep here: it would also match pkg/kube's k3s in the shared host PID
+# namespace.
 terminate_k3s() {
+    is_witness_k3s_running || return 0
+    pid=$(cat "$WITNESS_K3S_PID_FILE")
     max_attempts=4
     attempt=0
     while [ $attempt -lt $max_attempts ]; do
-        # K3S_SERVER_CMD is witness-unique (contains --node-name eve-witness)
-        # so this never matches pkg/kube's k3s in the shared PID namespace.
-        pids=$(pgrep -f "$K3S_SERVER_CMD")
-        if [ -z "$pids" ]; then
-            return 0
+        kill -0 "$pid" 2>/dev/null || return 0
+        if [ $attempt -lt 3 ]; then
+            kill "$pid" 2>/dev/null
+        else
+            kill -9 "$pid" 2>/dev/null
         fi
-        for pid in $pids; do
-            if [ $attempt -lt 3 ]; then
-                kill "$pid" 2>/dev/null
-            else
-                kill -9 "$pid" 2>/dev/null
-            fi
-        done
         sleep 1
         attempt=$((attempt + 1))
     done
-    return 1
+    kill -0 "$pid" 2>/dev/null && return 1
+    return 0
 }

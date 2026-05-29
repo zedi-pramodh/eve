@@ -17,19 +17,27 @@ K3S_STOP_FLAG="/run/kube/k3s-stop"
 # shellcheck disable=SC2034
 K3S_MANUAL_START_FLAG="/run/kube/k3s-start"
 
-# kube_k3s_pids returns the PIDs of pkg/kube's k3s server process, excluding
-# pkg/witness's. Both containers run with pid: host, so a plain
-# `pgrep -f "k3s server"` would also match the witness's k3s — which launches
-# itself with `--node-name eve-witness` to make this disambiguation possible.
-# All pgrep checks for the kube k3s server MUST use this helper, otherwise
-# pkg/kube will mis-detect the witness's process as its own (skipping start)
-# or accidentally send signals to the witness on terminate_k3s.
+# kube_k3s_pids returns the PIDs of pkg/kube's k3s server process,
+# excluding pkg/witness's. Both containers run with pid: host so a plain
+# `pgrep -f "k3s server"` would also match the witness's k3s. We CANNOT
+# disambiguate by cmdline: k3s strips its argv shortly after startup, so
+# any flag we passed (e.g. --node-name eve-witness) is gone from
+# /proc/<pid>/cmdline by the time we check.
+#
+# We instead filter by CGROUP membership. pkg/witness sets
+# `cgroupsPath: /eve/services/witness` in build.yml, so every process the
+# witness container spawns — including its k3s server — appears under
+# /eve/services/witness in /proc/<pid>/cgroup. We exclude those.
+#
+# All pgrep checks for the kube k3s server MUST use this helper. Calling
+# pgrep -f "$K3S_SERVER_CMD" directly will produce false positives
+# (treating witness's k3s as our own) and is bug-prone.
 kube_k3s_pids() {
     pgrep_pids=$(pgrep -f "$K3S_SERVER_CMD" 2>/dev/null)
     [ -z "$pgrep_pids" ] && return 0
     for pid in $pgrep_pids; do
-        [ -r "/proc/$pid/cmdline" ] || continue
-        if ! tr '\0' ' ' < "/proc/$pid/cmdline" | grep -q "eve-witness"; then
+        [ -r "/proc/$pid/cgroup" ] || continue
+        if ! grep -q "/eve/services/witness" "/proc/$pid/cgroup" 2>/dev/null; then
             echo "$pid"
         fi
     done
