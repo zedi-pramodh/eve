@@ -19,7 +19,13 @@
 #   node IP:   10.244.244.244 (lives on dummy iface eve-witness0)
 
 log: "/persist/kubelog/witness.log"
-node-ip: "10.244.244.244"
+
+# node-ip is NOT pinned here. It's rendered into
+# /etc/rancher/k3s/config.yaml.d/02-witness-network.yaml on every container
+# start by witness-init.sh, from $WITNESS_NODE_IP in lib/config.sh —
+# which can be overridden via /persist/witness-override.env without an
+# image rebuild. k3s merges config.yaml.d entries lexically *after* this
+# main config, so the rendered file wins.
 
 # Relocate the agent loadbalancer off the default 127.0.0.1:6444.
 #

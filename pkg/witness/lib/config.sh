@@ -10,14 +10,41 @@
 # the third etcd member using this exact name + IP pair.
 # shellcheck disable=SC2034
 WITNESS_NODE_NAME="eve-witness"
+
+# Phase 1 defaults. The IP rides a dummy interface (WITNESS_IFACE) created
+# by setup_witness_interface; both pkg/kube and pkg/witness share the host
+# network namespace, so binding the witness's k3s to a different IP is what
+# keeps the listeners (apiserver 6443, etcd 2379/2380) from colliding with
+# pkg/kube's k3s on the real interface.
 # shellcheck disable=SC2034
 WITNESS_NODE_IP="10.244.244.244"
-# Dummy interface that carries the witness IP on the host. Both pkg/kube and
-# pkg/witness share the host network namespace; this interface is what keeps
-# every k3s listener (apiserver 6443, etcd 2379/2380) from colliding with
-# pkg/kube's k3s on the real interface IP.
 # shellcheck disable=SC2034
 WITNESS_IFACE="eve-witness0"
+
+# Manual override for Phase 2 dry-runs (cluster IP + real interface,
+# without rebuilding the image). Drop a shell-syntax key=value file at
+# /persist/witness-override.env and the values below override the Phase 1
+# defaults above:
+#
+#   # /persist/witness-override.env
+#   WITNESS_NODE_IP=192.168.1.55
+#   WITNESS_IFACE=eth0
+#
+# /persist is unsealed before the witness starts and is bind-mounted into
+# the container, so the file is readable by the time this script sources.
+# setup_witness_interface already no-ops `ip link add` when WITNESS_IFACE
+# is an existing real interface and only adds WITNESS_NODE_IP as a
+# secondary address — same shape Phase 2 will need.
+#
+# Phase 2 will REMOVE this file mechanism and instead read the values
+# from /run/zedkube/EdgeNodeClusterStatus/global.json (see design doc
+# §6.1). Keep the override file's variable names matching the canonical
+# names here so the swap is mechanical.
+WITNESS_OVERRIDE_FILE="/persist/witness-override.env"
+if [ -r "$WITNESS_OVERRIDE_FILE" ]; then
+    # shellcheck source=/dev/null
+    . "$WITNESS_OVERRIDE_FILE"
+fi
 
 # Base static k3s config lives in /etc/rancher/k3s/config.yaml, anything else
 # drops into config.yaml.d for k3s to merge.
@@ -25,8 +52,14 @@ WITNESS_IFACE="eve-witness0"
 K3S_CONFIG_DIR="/etc/rancher/k3s/config.yaml.d"
 # shellcheck disable=SC2034
 K3S_NODENAME_CONFIG_FILE="${K3S_CONFIG_DIR}/00-nodename.yaml"
+# Phase 2 (cluster join) writes server/token/bind-address here.
 # shellcheck disable=SC2034
 K3S_CLUSTER_CONFIG_FILE="${K3S_CONFIG_DIR}/01-clusterconfig.yaml"
+# Auto-generated every boot from $WITNESS_NODE_IP — see render_witness_network_config
+# in witness-utils.sh. Lexically AFTER 00/01, so any later cluster-join
+# settings keep the right precedence.
+# shellcheck disable=SC2034
+K3S_NETWORK_CONFIG_FILE="${K3S_CONFIG_DIR}/02-witness-network.yaml"
 
 # No kubeconfig path: the witness runs as a dedicated etcd node
 # (disable-apiserver/controller-manager/scheduler in config.yaml). There

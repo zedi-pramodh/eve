@@ -124,6 +124,12 @@ while ! install_k3s; do
 done
 logmsg "k3s ${K3S_VERSION} installed under /var/lib/k3s/bin"
 
+# Render the dynamic node-ip overlay BEFORE the supervisor loop launches
+# k3s. If /persist/witness-override.env set a new WITNESS_NODE_IP, that
+# value is what lands in config.yaml.d/02-witness-network.yaml here, and
+# what k3s binds to on its first start.
+render_witness_network_config
+
 # Main supervision loop.
 #
 # Order matters: containerd must be up before k3s server, because kubelet
