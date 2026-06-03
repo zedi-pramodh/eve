@@ -148,6 +148,12 @@ render_witness_network_config
 # the witness reverts to Phase 1 standalone cleanly.
 render_witness_cluster_config
 
+# Drop a loopback-only CNI stub for kubelet. Without ANY conflist in
+# /etc/cni/net.d, kubelet reports NetworkPluginNotReady and the Node
+# stays NotReady. The witness never runs pods (cordoned + tainted), so a
+# no-op CNI is sufficient.
+render_witness_cni_stub
+
 # Cordon the witness Node as soon as it registers. Backgrounded so the
 # supervisor loop below isn't blocked waiting for the apiserver/Node to
 # come up. cordon_witness_node polls up to 5 minutes for the Node object

@@ -271,6 +271,33 @@ check_start_containerd() {
     return 0
 }
 
+# Drop a stub CNI conflist for kubelet to find. Without ANY CNI config in
+# /etc/cni/net.d, kubelet reports NetworkPluginNotReady and the node
+# stays NotReady — even though the witness has no pod-networking needs
+# (cordoned + tainted, no workloads will ever land here). The stub uses
+# only the loopback CNI plugin (ships with k3s) so it satisfies kubelet's
+# "is there a CNI" check without actually programming any pod networking.
+# Without this, we'd need real flannel — which collides with pkg/kube's
+# flannel.1 device when co-located.
+render_witness_cni_stub() {
+    # Witness's containerd-config.toml points CNI conf_dir at
+    # /var/lib/rancher/k3s/agent/etc/cni/net.d (and bin_dir at
+    # /var/lib/rancher/k3s/data/current/bin), NOT the standard
+    # /etc/cni/net.d. Match containerd's expectation.
+    cni_conf_dir=/var/lib/rancher/k3s/agent/etc/cni/net.d
+    mkdir -p "$cni_conf_dir"
+    cat > "$cni_conf_dir/00-witness-stub.conflist" <<'EOF'
+{
+  "cniVersion": "0.4.0",
+  "name": "witness-stub",
+  "plugins": [
+    { "type": "loopback" }
+  ]
+}
+EOF
+    logmsg "Rendered CNI stub at $cni_conf_dir/00-witness-stub.conflist"
+}
+
 # Mark the witness Node as Unschedulable once k3s has registered it. The
 # config.yaml taints (NoSchedule + NoExecute on
 # node-role.kubernetes.io/witness=true and CriticalAddonsOnly=true) already
@@ -282,9 +309,11 @@ check_start_containerd() {
 # Re-cordon on every boot is intentional: if an operator accidentally
 # uncordons the witness, the next restart restores the safety property.
 cordon_witness_node() {
-    max_wait=300
-    waited=0
-    while [ "$waited" -lt "$max_wait" ]; do
+    # Retry forever — k3s on the witness can take a long time to come up on
+    # busy hosts, and a 5-minute timeout that gives up was leaving the
+    # witness uncordoned across long crash-loop windows. The cost of
+    # polling is one kubectl-get every 10 seconds; well worth it.
+    while true; do
         # Need both the kubeconfig and the Node object before kubectl works.
         if [ -r /etc/rancher/k3s/k3s.yaml ] && \
            /usr/bin/k3s kubectl get node "$WITNESS_NODE_NAME" \
@@ -296,10 +325,7 @@ cordon_witness_node() {
             fi
         fi
         sleep 10
-        waited=$((waited + 10))
     done
-    logmsg "WARN: timed out waiting for Node ${WITNESS_NODE_NAME} to register; not cordoned"
-    return 1
 }
 
 # Returns 0 if the witness's own k3s server is alive, 1 otherwise. Reads

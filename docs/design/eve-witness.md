@@ -1,8 +1,28 @@
 # EVE-k Witness Node (pkg/witness)
 
-**Status:** Phase 1 implemented and validated on hardware (2026-05-28 — etcd
-member list returns the witness as `started`, endpoint health 26ms commit).
-Phase 2 (cluster join) not yet started.
+**Status:** Phase 1 working as of 2026-06-03 — witness comes up as a full
+k3s control-plane + etcd master node alongside pkg/kube on the same
+physical host, with `Ready,SchedulingDisabled` status and zero workload
+pods. Validated:
+
+```
+$ kubectl get nodes
+NAME          STATUS                     ROLES                AGE   VERSION
+eve-witness   Ready,SchedulingDisabled   control-plane,etcd   24m   v1.34.2+k3s1
+```
+
+The path to Phase 1 working was much longer than the original §5 plan
+suggested. Roughly every k3s subsystem (apiserver, controller-manager,
+scheduler, kubelet, kubelet-healthz, etcd loopback) had a port or device
+collision with pkg/kube in the shared host network namespace. §8a now
+documents every one — read it before adding any new collocated
+component.
+
+Phase 2 (cluster join) is **partly wired but not validated**. The code
+path is in place (override file → `render_witness_cluster_config` →
+drops `--cluster-init` via `is_witness_joining`) but the architectural
+blockers documented in §8a "Co-location ceiling" haven't been resolved.
+
 **Branch:** `eve-witness`
 **Related external doc:** *EVE-k 2-Node HA Design — pkg/k3s Witness Architecture* (Google Docs, dated May 26 2026).
 
@@ -635,6 +655,88 @@ containerd doesn't strip argv, so a witness-unique exec path is enough.
 Do **not** rely on `--config` or other flags as the discriminator —
 they're easier to overlook when adding new pgrep callsites in pkg/kube.
 
+### Full collision matrix on a co-located host
+
+The witness shares the host network namespace, PID namespace, `/run`,
+and `/sys/fs/cgroup` with pkg/kube. Every k3s subsystem that hardcodes a
+loopback bind or a global device name collides. The complete fix set
+that gets Phase 1 working (witness `Ready,SchedulingDisabled` next to a
+fully-functional pkg/kube) lives in `pkg/witness/config.yaml`:
+
+| # | Collision | k3s default | Witness fix |
+|---|---|---|---|
+| 1 | Supervisor / apiserver | `0.0.0.0:6443` | `https-listen-port: 6644`, `supervisor-port: 6644` |
+| 2 | Agent loadbalancer | `127.0.0.1:6444` (hardcoded, NOT supervisor-port-derived) | `lb-server-port: 6645` |
+| 3 | Etcd client | `127.0.0.1:2379` (SO_REUSEPORT'd with pkg/kube → random misroute → TLS unknown-authority) | `kube-apiserver-arg: etcd-servers=https://${NODE_IP}:2379` (route the apiserver around the collision; trying to override `listen-client-urls` via `etcd-arg` triggers the §8a transient-etcd cert-missing crash) |
+| 4 | Etcd peer | `127.0.0.1:2380` (same SO_REUSEPORT issue) | NO FIX in Phase 1. Affects Phase 2 join (raft replication ambiguity). See "Co-location ceiling" below. |
+| 5 | Controller-manager secure-port | `127.0.0.1:10257` | `kube-controller-arg: secure-port=10357` |
+| 6 | Scheduler secure-port | `127.0.0.1:10259` | `kube-scheduler-arg: secure-port=10359` |
+| 7 | Kubelet API | `*:10250` (wildcard, blocks specific-IP bind on a second instance) | `kubelet-arg: port=10350` + matching `kube-apiserver-arg: kubelet-port=10350` so apiserver dials the new port |
+| 8 | Kubelet healthz | `127.0.0.1:10248` | `kubelet-arg: healthz-port=10448` |
+| 9 | Flannel `flannel.1` device | global VXLAN name | `flannel-backend: none` (no flannel → no `flannel.1`) + `disable-kube-proxy: true` (same iptables-collision logic) |
+| 10 | Local-storage volume path | `/persist/vault/volumes` shared with pkg/kube | `default-local-storage-path: /persist/vault/witness-volumes` |
+| 11 | k3s embedded containerd socket | `/run/k3s/containerd/containerd.sock` shared with pkg/kube | `container-runtime-endpoint: unix:///run/witness/containerd/containerd.sock` + witness-private containerd spawned by `check_start_containerd` (see "Witness containerd MUST exec from a witness-unique path" above) |
+| 12 | k3s addon Pending pods (single-node + tainted = nothing schedules) | `coredns`, `local-storage`, `metrics-server`, `servicelb`, `traefik` all default-on | `disable: [coredns, local-storage, metrics-server, servicelb, traefik]` |
+| 13 | k8s 1.34 NodeRestriction admission | `kubelet --node-labels=node-role.kubernetes.io/witness=true` is rejected | Removed `node-label`; only `node-taint` (NoSchedule + NoExecute) blocks scheduling. Apply role label via `kubectl` post-startup if needed. |
+| 14 | kubelet wants CNI conf | `flannel-backend: none` means no CNI → kubelet stays NotReady (`cni plugin not initialized`) | `render_witness_cni_stub` writes a loopback-only conflist at `/var/lib/rancher/k3s/agent/etc/cni/net.d/00-witness-stub.conflist` — the path the witness's `containerd-config.toml` looks at (NOT the standard `/etc/cni/net.d/`) |
+
+### Co-location ceiling: what Phase 1 leaves unsolved
+
+After working through the matrix above, two architectural issues remain
+that block Phase 2 cluster-join when the witness is co-located with a
+seed:
+
+1. **Etcd peer port `127.0.0.1:2380`**. The witness's etcd and pkg/kube's
+   etcd both bind this via SO_REUSEPORT. `--etcd-arg listen-peer-urls=`
+   would deconflict, but trips the bootstrap-transient-etcd cert-missing
+   bug already documented at the top of §8a. There's no clean k3s flag
+   to skip the loopback peer listener. For Phase 1 standalone (one
+   member, no raft replication needed), this doesn't matter. For Phase
+   2 join, raft messages between members are routed randomly between
+   pkg/kube's and witness's etcd → cluster-info fetch fails or returns
+   wrong-cluster certs.
+
+2. **`flannel-backend` critical-config mismatch**. k3s's join handshake
+   checks that `flannel-backend` is identical across all etcd-member
+   servers. pkg/kube uses the default (vxlan); witness needs `none` to
+   avoid the `flannel.1` collision in (9) above. Matching them by giving
+   witness `vxlan` reintroduces the flannel device collision at runtime
+   (`failed to add device flannel.1: file exists`). The user can sidestep
+   this only if pkg/kube *also* uses `flannel-backend: none` (e.g. with
+   Multus providing the primary CNI), in which case witness's `none`
+   matches.
+
+The genuine fix for both is **don't co-locate the witness with a cluster
+member on the same physical host**. The original §1 use-case (2-node
+clusters where there is no third host) is the design's actual target:
+the witness lives next to the seed, but the seed is the *only* node on
+that host. In that topology, the loopback collisions wouldn't matter
+because there's no second k3s server on the same host to fight with.
+
+For testing Phase 2 join in setups that *do* have co-located peers
+(e.g. running on a 3-node cluster on a single dev box), the realistic
+options are:
+
+- Move the witness to a separate physical host (or VM).
+- Move to k3d-style net-namespace isolation in `build.yml` (remove
+  `pid: host`, drop `/run` + `/sys/fs/cgroup` shared binds, plumb veth
+  pair). This is a sizable architectural change but is what k3d does
+  successfully.
+- Use external etcd (drop k3s-embedded etcd entirely, all cluster
+  members talk to a separate etcd cluster via `--datastore-endpoint`).
+  Listed as alternative (c) in §9.
+
+### Cordon helper polls forever (not 5 minutes)
+
+Earlier the `cordon_witness_node` helper in `witness-utils.sh` timed
+out after 5 minutes if the Node didn't register by then. With long
+crash-loops during initial bring-up (or when k3s is slow on a busy
+host), the cordon was missing — the node came up `Ready` instead of
+`Ready,SchedulingDisabled`. Helper is now an infinite-retry loop with
+a 10-second poll interval. Cost is negligible (one kubectl-get every
+10s); benefit is the witness is always cordoned regardless of how slow
+the apiserver came up.
+
 ### State persistence map (which paths survive what)
 
 | Path in container | Backed by | Survives container restart? | Survives device reboot? |
@@ -667,51 +769,55 @@ handles `K3S_USER_OVERRIDE_CONFIG_SRC`.
 
 New:
 
-- `pkg/witness/build.yml`
-- `pkg/witness/Dockerfile`
-- `pkg/witness/config.yaml` (includes `lb-server-port: 6645`,
-  `supervisor-port: 6644`, `https-listen-port: 6644` — see §8a)
-- `pkg/witness/00-nodename.yaml`
-- `pkg/witness/containerd-config.toml`
-- `pkg/witness/lib/config.sh`
-- `pkg/witness/witness-utils.sh`
-- `pkg/witness/witness-init.sh`
+- `pkg/witness/build.yml` — linuxkit service (pid:host, /run+/persist binds, cgroupsPath=/eve/services/witness)
+- `pkg/witness/Dockerfile` — eve-alpine base + etcdctl + scripts
+- `pkg/witness/config.yaml` — the full collision-avoidance config (see §8a Full collision matrix)
+- `pkg/witness/00-nodename.yaml` — static `node-name: eve-witness`
+- `pkg/witness/containerd-config.toml` — witness-private containerd config (paths under `/run/witness/`, `/var/lib/witness-containerd`, CNI conf_dir at `/var/lib/rancher/k3s/agent/etc/cni/net.d/`)
+- `pkg/witness/lib/config.sh` — runtime override (WITNESS_NODE_IP / WITNESS_IFACE / WITNESS_JOIN_URL / WITNESS_JOIN_TOKEN read from /persist/witness-override.env)
+- `pkg/witness/witness-utils.sh` — render helpers (network, cluster-join, CNI stub), cordon (infinite retry), `is_witness_k3s_running` (PID file + zombie reject), `check_start_containerd` (witness-unique binary path)
+- `pkg/witness/witness-init.sh` — boot flow + supervisor loop
 - `docs/design/eve-witness.md` (this file)
 
 Modified (pkg/kube and rootfs wiring):
 
-- `images/modifiers/hv/k.yq` — append witness service entry
+- `images/modifiers/hv/k.yq` — append witness service entry with `cgroupsPath: /eve/services/witness`
 - `tools/parse-pkgs.sh` — declare and export `WITNESS_TAG`
-- `pkg/kube/cluster-utils.sh` — add `kube_k3s_pids()` helper, migrate
-  callsites
-- `pkg/kube/cluster-init.sh` — migrate two `pgrep` callsites to helper
+- `pkg/kube/cluster-utils.sh` — add `kube_k3s_pids()` helper (cgroup filter, not cmdline — k3s strips argv)
+- `pkg/kube/cluster-init.sh` — migrate `pgrep` callsites to helper; `check_start_containerd` still pgrep-on-binary-path because witness uses `/var/lib/witness/bin/containerd` (see "Witness containerd MUST exec from a witness-unique path" in §8a)
 
 ## 11. Commit plan
 
-The branch `eve-witness` currently has the work as a series of wip-named
-commits (`Witness support`, `witness on vault`, `Include eve-witness in the
-build`, `fix(eve-k): disambiguate pkg/kube vs pkg/witness k3s processes`,
-`Latest code to disable-agent`, `change config values`, `Try again`). Before
-pushing for review, rebase / squash into the conventional set below:
+Phase 1 is a single working unit — every fix in the §8a Full collision
+matrix is inter-dependent (remove any one and k3s either won't come up
+or won't go Ready). Squash the wip commits on `eve-witness` into a small
+conventional series:
 
 1. `feat(pkg/witness): scaffold witness package for 2-node EVE-k HA`
-   (pkg/witness/ initial scaffold — build.yml, Dockerfile, config.yaml,
-   00-nodename.yaml, lib/config.sh, witness-init.sh, witness-utils.sh)
-2. `fix(pkg/witness): bind /persist/vault/witness onto /var/lib for persistence`
-   (persistence layer — wait_for_vault + mount_witness_root + install_k3s)
-3. `feat(pkg/witness): include witness service in EVE-k rootfs`
-   (k.yq + parse-pkgs.sh — WITNESS_TAG)
-4. `fix(eve-k): disambiguate pkg/kube vs pkg/witness k3s processes`
-   (pgrep coexistence — touches both pkg/kube and pkg/witness; adds
-   kube_k3s_pids() helper)
-5. `refactor(pkg/witness): switch to dedicated-etcd-node mode + private containerd`
-   (drop --disable-agent, add disable-apiserver/controller-manager/scheduler/
-   kube-proxy + flannel-backend none + node taints + witness-private
-   containerd at /run/witness/containerd/ + containerd-config.toml)
-6. `fix(pkg/witness): relocate agent loadbalancer off 127.0.0.1:6444`
-   (lb-server-port: 6645 + supervisor-port/https-listen-port: 6644 — see
-   §8a "Agent loadbalancer collides on 127.0.0.1:6444"; without this k3s
-   crash-loops with etcd visible-up but the supervised tree torn down)
-7. `docs(design): add eve-witness design doc` (this file — includes the
-   bring-up gotchas in §8a, the operations checklist in §7, and the
-   decision matrix in §9)
+   build.yml, Dockerfile, 00-nodename.yaml, containerd-config.toml,
+   lib/config.sh (with override-file mechanism), witness-init.sh,
+   witness-utils.sh, initial config.yaml.
+2. `feat(pkg/witness): include witness service in EVE-k rootfs`
+   k.yq + parse-pkgs.sh — WITNESS_TAG, `cgroupsPath: /eve/services/witness`.
+3. `fix(eve-k): disambiguate pkg/kube vs pkg/witness in shared host namespace`
+   pkg/kube/cluster-utils.sh `kube_k3s_pids()` via cgroup filter; witness
+   PID-file lifecycle (`is_witness_k3s_running` with zombie reject);
+   witness-private containerd at `/var/lib/witness/bin/containerd`.
+4. `fix(pkg/witness): port + device collision matrix for co-located k3s`
+   The full §8a Full collision matrix in `config.yaml`: port shifts
+   (6644/6645/10350/10357/10359/10448), `flannel-backend: none`,
+   `disable-kube-proxy: true`, witness-specific
+   `default-local-storage-path`, addon disables,
+   `kube-apiserver-arg: etcd-servers=https://${IP}:2379`,
+   `kube-apiserver-arg: kubelet-port=10350`.
+5. `feat(pkg/witness): runtime overrides + cluster-join wiring`
+   Phase 2 plumbing — `WITNESS_JOIN_URL`/`WITNESS_JOIN_TOKEN` in
+   lib/config.sh, `render_witness_cluster_config`, `is_witness_joining`,
+   `start_k3s_once` drops `--cluster-init` when joining.
+6. `feat(pkg/witness): CNI stub + auto-cordon for Phase 1 Ready`
+   `render_witness_cni_stub` writes the loopback-only conflist at the
+   containerd-configured path; `cordon_witness_node` polls forever.
+7. `docs(design): document Phase 1 collision matrix + co-location ceiling`
+   this file — comprehensive §8a Full collision matrix and the
+   unresolved etcd-peer-port + flannel-backend-mismatch blockers for
+   Phase 2 join.
