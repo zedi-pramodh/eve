@@ -130,6 +130,14 @@ logmsg "k3s ${K3S_VERSION} installed under /var/lib/k3s/bin"
 # what k3s binds to on its first start.
 render_witness_network_config
 
+# Cordon the witness Node as soon as it registers. Backgrounded so the
+# supervisor loop below isn't blocked waiting for the apiserver/Node to
+# come up. cordon_witness_node polls up to 5 minutes for the Node object
+# and the local kubeconfig; once both are ready, it issues `kubectl cordon`
+# and exits. The config.yaml taints already block scheduling — this is the
+# operator-visible reinforcement (STATUS shows SchedulingDisabled).
+( cordon_witness_node ) &
+
 # Main supervision loop.
 #
 # Order matters: containerd must be up before k3s server, because kubelet

@@ -61,12 +61,13 @@ K3S_CLUSTER_CONFIG_FILE="${K3S_CONFIG_DIR}/01-clusterconfig.yaml"
 # shellcheck disable=SC2034
 K3S_NETWORK_CONFIG_FILE="${K3S_CONFIG_DIR}/02-witness-network.yaml"
 
-# No kubeconfig path: the witness runs as a dedicated etcd node
-# (disable-apiserver/controller-manager/scheduler in config.yaml). There
-# is no apiserver to write a kubeconfig for, and no point exposing one.
-# Liveness checks go through etcdctl against https://10.244.244.244:2379
-# and "kubectl get nodes" on the seed (the witness appears there because
-# kubelet runs). See design doc §7.
+# The witness runs as a full k3s server (apiserver + controller-manager +
+# scheduler + etcd + kubelet + flannel — same shape as pkg/kube), but is
+# automatically cordoned at startup and tainted NoSchedule/NoExecute so it
+# never hosts workloads. Local kubeconfig lands at the default k3s path:
+#   /etc/rancher/k3s/k3s.yaml
+# cordon_witness_node in witness-utils.sh uses that to mark the Node
+# SchedulingDisabled once it registers.
 
 # Private containerd that kubelet talks to. pkg/kube uses
 # /run/containerd-user/containerd.sock — we use a sibling path so the two

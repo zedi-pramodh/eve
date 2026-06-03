@@ -231,6 +231,37 @@ check_start_containerd() {
     return 0
 }
 
+# Mark the witness Node as Unschedulable once k3s has registered it. The
+# config.yaml taints (NoSchedule + NoExecute on
+# node-role.kubernetes.io/witness=true and CriticalAddonsOnly=true) already
+# block scheduling, but cordoning is the explicit, operator-visible signal
+# in `kubectl get nodes` (STATUS=Ready,SchedulingDisabled). Idempotent —
+# `kubectl cordon` on an already-cordoned node is a no-op.
+#
+# Called once after the first successful k3s start (see witness-init.sh).
+# Re-cordon on every boot is intentional: if an operator accidentally
+# uncordons the witness, the next restart restores the safety property.
+cordon_witness_node() {
+    max_wait=300
+    waited=0
+    while [ "$waited" -lt "$max_wait" ]; do
+        # Need both the kubeconfig and the Node object before kubectl works.
+        if [ -r /etc/rancher/k3s/k3s.yaml ] && \
+           /usr/bin/k3s kubectl get node "$WITNESS_NODE_NAME" \
+               --kubeconfig=/etc/rancher/k3s/k3s.yaml >/dev/null 2>&1; then
+            if /usr/bin/k3s kubectl cordon "$WITNESS_NODE_NAME" \
+                   --kubeconfig=/etc/rancher/k3s/k3s.yaml >> "$INSTALL_LOG" 2>&1; then
+                logmsg "Cordoned ${WITNESS_NODE_NAME} (SchedulingDisabled)"
+                return 0
+            fi
+        fi
+        sleep 10
+        waited=$((waited + 10))
+    done
+    logmsg "WARN: timed out waiting for Node ${WITNESS_NODE_NAME} to register; not cordoned"
+    return 1
+}
+
 # Returns 0 if the witness's own k3s server is alive, 1 otherwise. Reads
 # the PID we wrote at launch time and validates it's still a k3s process
 # (defends against PID reuse).
