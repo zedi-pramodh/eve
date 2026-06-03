@@ -86,16 +86,28 @@ start_k3s_once() {
     current_wait_time=$((current_wait_time * 2))
     [ "$current_wait_time" -gt "$MAX_WAIT_TIME" ] && current_wait_time=$MAX_WAIT_TIME
 
-    # Phase 1: --cluster-init brings up the etcd cluster (this one member,
-    # the witness). config.yaml disables apiserver/controller-manager/
-    # scheduler/kube-proxy/flannel and applies the NoSchedule taint.
-    # --node-name eve-witness is also in 00-nodename.yaml as the source
-    # of truth; passing it on the CLI is harmless (k3s accepts both) but
-    # is NOT load-bearing for process identification — see PID file dance.
-    nohup /usr/bin/k3s server \
-        --node-name eve-witness \
-        --cluster-init \
-        >> "${K3S_LOG_DIR}/${WITNESS_LOG_FILE}" 2>&1 &
+    # --cluster-init is mutually exclusive with joining an existing cluster.
+    # is_witness_joining returns true when WITNESS_JOIN_URL is set in the
+    # override file AND render_witness_cluster_config has written the
+    # 01-clusterconfig.yaml (server: + token:). In that case k3s reads the
+    # join inputs from the config file and we omit --cluster-init from the
+    # CLI so the witness joins instead of forms a new cluster.
+    #
+    # --node-name eve-witness is also in 00-nodename.yaml as the source of
+    # truth; passing it on the CLI is harmless (k3s accepts both) but is
+    # NOT load-bearing for process identification — see PID file dance.
+    if is_witness_joining; then
+        logmsg "Joining cluster at ${WITNESS_JOIN_URL} (no --cluster-init)"
+        nohup /usr/bin/k3s server \
+            --node-name eve-witness \
+            >> "${K3S_LOG_DIR}/${WITNESS_LOG_FILE}" 2>&1 &
+    else
+        logmsg "Phase 1 standalone — using --cluster-init"
+        nohup /usr/bin/k3s server \
+            --node-name eve-witness \
+            --cluster-init \
+            >> "${K3S_LOG_DIR}/${WITNESS_LOG_FILE}" 2>&1 &
+    fi
     k3s_pid=$!
     # Write the PID file IMMEDIATELY — that's our only reliable handle on
     # this process once k3s strips its argv.
@@ -129,6 +141,12 @@ logmsg "k3s ${K3S_VERSION} installed under /var/lib/k3s/bin"
 # value is what lands in config.yaml.d/02-witness-network.yaml here, and
 # what k3s binds to on its first start.
 render_witness_network_config
+
+# If WITNESS_JOIN_URL / WITNESS_JOIN_TOKEN are set in the override file,
+# write the join overlay (server + token) to config.yaml.d/01-clusterconfig.yaml.
+# When unset, this also clears any stale join overlay from a prior boot so
+# the witness reverts to Phase 1 standalone cleanly.
+render_witness_cluster_config
 
 # Cordon the witness Node as soon as it registers. Backgrounded so the
 # supervisor loop below isn't blocked waiting for the apiserver/Node to

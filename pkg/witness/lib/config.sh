@@ -21,30 +21,43 @@ WITNESS_NODE_IP="10.244.244.244"
 # shellcheck disable=SC2034
 WITNESS_IFACE="eve-witness0"
 
-# Manual override for Phase 2 dry-runs (cluster IP + real interface,
-# without rebuilding the image). Drop a shell-syntax key=value file at
-# /persist/witness-override.env and the values below override the Phase 1
-# defaults above:
+# Manual override for Phase 2 dry-runs (cluster IP + real interface +
+# cluster join inputs), without rebuilding the image. Drop a shell-syntax
+# key=value file at /persist/witness-override.env. Recognised keys:
 #
 #   # /persist/witness-override.env
-#   WITNESS_NODE_IP=192.168.1.55
-#   WITNESS_IFACE=eth0
+#   #
+#   # Network identity (always):
+#   WITNESS_NODE_IP=192.168.1.55       # IP the witness's k3s binds to
+#   WITNESS_IFACE=eth0                 # iface that carries the IP
+#   #
+#   # Cluster join (Phase 2 — set ALL three to join, leave UNSET for
+#   # Phase 1 standalone where the witness forms its own cluster):
+#   WITNESS_JOIN_URL=https://192.168.1.10:6443     # seed's apiserver
+#   WITNESS_JOIN_TOKEN="K10abc...::server:..."     # /var/lib/rancher/k3s/server/token on seed
 #
 # /persist is unsealed before the witness starts and is bind-mounted into
 # the container, so the file is readable by the time this script sources.
 # setup_witness_interface already no-ops `ip link add` when WITNESS_IFACE
 # is an existing real interface and only adds WITNESS_NODE_IP as a
-# secondary address — same shape Phase 2 will need.
+# secondary address.
 #
-# Phase 2 will REMOVE this file mechanism and instead read the values
-# from /run/zedkube/EdgeNodeClusterStatus/global.json (see design doc
-# §6.1). Keep the override file's variable names matching the canonical
-# names here so the swap is mechanical.
+# Phase 2 with the cloud will REPLACE this file with reads from
+# /run/zedkube/EdgeNodeClusterStatus/global.json (see design doc §6.1).
+# Keep the variable names matching the canonical names here so the swap
+# is mechanical.
 WITNESS_OVERRIDE_FILE="/persist/witness-override.env"
 if [ -r "$WITNESS_OVERRIDE_FILE" ]; then
     # shellcheck source=/dev/null
     . "$WITNESS_OVERRIDE_FILE"
 fi
+
+# The presence of WITNESS_JOIN_URL is the signal "we're joining an existing
+# cluster" — witness-utils.sh:render_witness_cluster_config writes a
+# config.yaml.d/01-clusterconfig.yaml only when this is set, and
+# witness-init.sh:start_k3s_once omits --cluster-init in that case. Without
+# WITNESS_JOIN_URL, the witness boots as a standalone single-member
+# cluster (Phase 1).
 
 # Base static k3s config lives in /etc/rancher/k3s/config.yaml, anything else
 # drops into config.yaml.d for k3s to merge.
