@@ -1,209 +1,110 @@
 ---
 # k3s server config for the EVE-k witness node.
 #
-# Mode: full k3s server — apiserver, controller-manager, scheduler, etcd,
-# kubelet, kube-proxy, and flannel all enabled (same shape as pkg/kube).
-# The witness is a regular control-plane Kubernetes node, just one that
-# never runs workloads:
-#   - cordoned automatically at startup (witness-init.sh →
-#     cordon_witness_node), so `kubectl get nodes` shows it as
-#     SchedulingDisabled
-#   - tainted NoSchedule + NoExecute via node-taint below as a stronger
-#     guard against wildcard-toleration pods
+# Architecture (Phase 1.5+ FINAL — see git history for what was tried):
 #
-# Coexistence with pkg/kube on the same physical seed node hinges on:
-#   - witness's k3s binds to WITNESS_NODE_IP (10.244.244.244 by default,
-#     overridable via /persist/witness-override.env). Apiserver,
-#     supervisor, etcd, and kubelet all listen on that IP — different IP
-#     than pkg/kube's, so same default ports don't collide.
-#   - listen-port shifts (6644 / 6645) move the apiserver-supervisor and
-#     the agent loadbalancer off pkg/kube's hardcoded 6443/6444. See
-#     design doc §8a for why the LB shift is mandatory.
-#   - container-runtime-endpoint uses a witness-private containerd socket
-#     so the two packages don't share state.
+# The witness runs k3s in **server-only mode** (--disable-agent) inside
+# its own network namespace (eve-witness). It contributes apiserver,
+# controller-manager, scheduler, and — critically — etcd to the cluster.
+# It does NOT run kubelet, kube-proxy, or flannel. The witness has no
+# Kubernetes Node object, doesn't appear in `kubectl get nodes`, and
+# never hosts workloads. Its sole purpose is to be the 3rd etcd vote
+# for HA quorum in a 2-physical-node EVE-k cluster.
+#
+# Why server-only mode?
+#
+# In Phase 1 we tried co-locating two full k3s instances on the same
+# host (pkg/kube + pkg/witness, each with kubelet). That collided on
+# every host-shared resource — ports, flannel.1, iptables, etcd
+# loopback. We pushed the witness into its own netns in Phase 1.5,
+# which fixed networking collisions cleanly.
+#
+# But cgroups can't be netns-isolated. linuxkit gives each container
+# its own cgroup slice (e.g. /eve/services/witness) but a HOST-VISIBLE
+# /sys/fs/cgroup tree, so both kubelets see the same cgroup hierarchy.
+# With the default cgroup-root="/", each kubelet creates and manages
+# /sys/fs/cgroup/<controller>/kubepods/... at the host root — both
+# believing they own it. The witness's kubelet then reconcile-deletes
+# pkg/kube's pod cgroups (they don't appear in its apiserver, so they
+# look stale to it), and pkg/kube's containers die mid-init with
+# "cannot start a stopped process" / "procReady not received".
+#
+# We tried scoping the witness kubelet's cgroup-root to
+# /eve/services/witness — but linuxkit assigns the witness slice a
+# cpuset.cpus of just "0", and cgroup-v1's cpuset constraint (a child
+# must be a SUBSET of its parent) means kubelet can't create kubepods
+# with cpuset.cpus=0-3 under it. Widening the parent fails with EACCES
+# because linuxkit owns those files. Dead end.
+#
+# --disable-agent eliminates the entire kubelet path: no kubepods, no
+# cgroup collision, no cordon-needed (no Node), no flannel-needed (no
+# CNI), no kube-proxy (no iptables). The witness is purely a k3s
+# control-plane server contributing etcd to the cluster.
+#
+# The Phase 1 §8a collision matrix (port shifts, flannel-backend:none,
+# disable-kube-proxy, kube-apiserver-arg overrides, peer-cert-allowed-
+# hostname, etc.) is permanently obsolete:
+#   - The netns isolates ports / iptables / 127.0.0.1 / flannel.1.
+#   - --disable-agent removes kubelet + kube-proxy + flannel entirely.
+#   - The remaining components (apiserver/controller-manager/scheduler/
+#     etcd) all bind to node-ip inside the netns. Zero host collision.
 #
 # Reserved witness identity (fixed across all EVE-k installs):
-#   node name: eve-witness   (also on the CLI for pgrep disambiguation)
-#   node IP:   10.244.244.244 (lives on dummy iface eve-witness0)
+#   node name: eve-witness   (00-nodename.yaml — kept for etcd member
+#                             identification even without a Node object)
+#   node IP:   WITNESS_NODE_IP (rendered to 02-witness-network.yaml)
 
 log: "/persist/kubelog/witness.log"
 write-kubeconfig-mode: "0644"
 
-# node-ip is NOT pinned here. It's rendered into
-# /etc/rancher/k3s/config.yaml.d/02-witness-network.yaml on every container
-# start by witness-init.sh, from $WITNESS_NODE_IP in lib/config.sh —
-# which can be overridden via /persist/witness-override.env without an
-# image rebuild. k3s merges config.yaml.d entries lexically *after* this
-# main config, so the rendered file wins.
+# THE pivot — see the long comment above.
+disable-agent: true
 
-# Port shifts to avoid colliding with pkg/kube in the shared host network
-# namespace. The agent loadbalancer port is the load-bearing one — it's a
-# hardcoded 127.0.0.1:6444 default that does NOT derive from supervisor-port
-# (see design doc §8a). The accompanying https-listen-port / supervisor-port
-# shifts keep all witness listeners in a contiguous 6644/6645 range for
-# easier auditing on the seed.
-#
-#   supervisor / apiserver listen → ${WITNESS_NODE_IP}:6644
-#   agent supervisor LB           → 127.0.0.1:6645
-#
-# Empirically validated 2026-05-28 on k3s v1.34.2+k3s1.
-https-listen-port: 6644
-supervisor-port: 6644
-lb-server-port: 6645
+# node-ip is rendered into config.yaml.d/02-witness-network.yaml on every
+# container start by witness-init.sh, from $WITNESS_NODE_IP in
+# lib/config.sh — overridable via /persist/witness-override.env without
+# an image rebuild.
 
 # Match pkg/kube's "disable agent tunneling, we are on the same network".
-# Same value across all servers in the cluster — required by k3s's
-# critical-configuration check at join time.
+# Required by k3s's critical-configuration check at Phase 2 join time —
+# all servers in the cluster must agree.
 egress-selector-mode: "disabled"
 
-# Match pkg/kube's disabled add-ons.
+# Match pkg/kube's disabled add-ons (critical-config compatibility).
 disable-network-policy: true
 disable-cloud-controller: true
+
+# Even though --disable-agent means no Node will exist to schedule
+# add-on pods onto, leave the addon disables in place. They affect
+# what k3s WRITES to /var/lib/rancher/k3s/server/manifests/ at startup
+# (charts that would otherwise sit Pending if a Node ever appeared).
+# Matches pkg/kube's set for Phase 2 critical-config compatibility.
 disable:
   - servicelb
   - traefik
-  # The witness is the only node in its own cluster and is tainted
-  # NoSchedule+NoExecute, so coredns/local-path-provisioner/metrics-server
-  # can never actually schedule and just sit Pending forever. Disable them
-  # outright — these are workload-helper add-ons the witness has no use for.
   - coredns
   - local-storage
   - metrics-server
 
-# CNI / flannel: when the witness is co-located with a cluster node on the
-# same physical host (the common single-host EVE-k case), both k3s servers
-# would try to create the global `flannel.1` VXLAN device — second to
-# start fails, kubelet stays NotReady ("runtime core not ready"), the
-# whole supervisor tree falls apart.
-#
-# The witness has no pod-networking needs (cordoned + tainted, no
-# workloads), so disable flannel + kube-proxy outright. kubelet still
-# registers the Node, apiserver + etcd work, witness still casts its
-# vote in etcd quorum — just doesn't program any pod networking.
-#
-# Trade-off: cluster join (Phase 2) requires k3s critical-config to
-# match across members. pkg/kube uses default flannel-backend (vxlan)
-# while witness uses none → join will fail with "critical configuration
-# mismatch: flannel-backend". This means the witness ONLY works as a
-# standalone master in this configuration. True Phase 2 multi-host join
-# is an open problem — see design doc.
-flannel-backend: none
-disable-kube-proxy: true
-
-# Use our own containerd at /run/witness/containerd/containerd.sock —
-# witness-init.sh spawns it before launching k3s. pkg/kube uses the
-# equivalent /run/containerd-user/containerd.sock. k3s's embedded
-# containerd at /run/k3s/containerd/containerd.sock is never started
-# because we point kubelet at this external one.
-container-runtime-endpoint: "unix:///run/witness/containerd/containerd.sock"
-
-# Local-path-provisioner storage root, witness-specific. pkg/kube uses
-# /persist/vault/volumes; the witness MUST NOT share that dir or local PVs
-# would clash. The taints + cordon below keep workloads off the witness in
-# practice, so this path is unlikely to ever be written — but pinning it
-# is defensive in case a future k3s changes scheduling defaults.
-default-local-storage-path: "/persist/vault/witness-volumes"
-
-# Nothing schedules on the witness. The cordon (set by witness-init.sh
-# after startup) is the operator-visible signal; the taints below are the
-# enforcement.
-#
-# Note on labels: k8s 1.34's NodeRestriction blocks `kubernetes.io/*`
-# labels from --node-labels at kubelet startup (only kubelet.kubernetes.io,
-# node.kubernetes.io, and a specific allow-list permitted). So we can't
-# self-label with `node-role.kubernetes.io/witness` here. If that role
-# label is needed for operator visibility, apply it post-startup via
-# `kubectl label node eve-witness node-role.kubernetes.io/witness=`
-# from a privileged context (operator role, not kubelet).
-#
-# Taints in the kubernetes.io namespace ARE allowed via --register-with-taints
-# so the NoSchedule + NoExecute below still apply.
-node-taint:
-  - "node-role.kubernetes.io/witness=true:NoSchedule"
-  # Defence-in-depth — anything with a wildcard toleration would still
-  # be evicted by this stronger NoExecute taint.
-  - "CriticalAddonsOnly=true:NoExecute"
-
-# etcd tuning. Match pkg/kube's settings; URL flags intentionally absent —
-# k3s derives them from node-ip and overriding them (peer OR client) breaks
-# the bootstrap transient etcd. See design doc §8a "Don't override etcd
-# peer/client URLs via etcd-arg" — client-urls has the same problem as
-# peer-urls, the transient etcd gets a TLS URL with no certs and dies
-# with "TLS key/cert must be provided for client url ... with HTTPS scheme".
-#
-# Loopback :2379 collision with pkg/kube is solved on the *apiserver
-# side* via kube-apiserver-arg=etcd-servers=https://${NODE_IP}:2379 below.
-# k3s internal subsystems that still dial 127.0.0.1:2379 may occasionally
-# hit pkg/kube's etcd (SO_REUSEPORT round-robin) — same TLS-bad-cert
-# symptom we've seen — but it's transient noise rather than a hard fail.
+# etcd tuning. Match pkg/kube's settings. URL flags intentionally absent —
+# k3s derives them from node-ip and overriding them breaks bootstrap
+# reconcile (see design doc §8a "Don't override etcd peer/client URLs
+# via etcd-arg").
 etcd-arg:
   - "quota-backend-bytes=2147483648"
   - "auto-compaction-mode=periodic"
   - "auto-compaction-retention=1h"
   - "snapshot-count=5000"
-  # Phase 2 join half-fix for co-location: when the witness is on the same
-  # host as a cluster member, the kernel rewrites the source IP of incoming
-  # peer connections from the local cluster member to be the witness's own
-  # IP (10.244.240.5). The connecting cert was issued for the cluster
-  # member's IP (e.g. 10.244.240.3) and has no 10.244.240.5 in SAN — etcd's
-  # default cert.VerifyHostname rejects it. peer-cert-allowed-hostname
-  # tells etcd to verify against "localhost" (which IS in every k3s peer
-  # cert's DNS SAN) instead of the remote-addr. Direction B fixed.
-  #
-  # Direction A (witness → cluster member, kernel rewrites src to peer IP)
-  # still fails because the cluster's etcd doesn't have this flag set.
-  # Fully fixing Phase 2 co-located join requires the same flag on pkg/kube
-  # (and witness's peer cert with extra SANs). See design doc §8a
-  # "Co-location ceiling".
-  - "peer-cert-allowed-hostname=localhost"
 etcd-expose-metrics: true
 
-# Kubelet + controller-manager tuning matched to pkg/kube. event-ttl is
-# the only apiserver-arg — pkg/kube also sets authentication-token-webhook
-# but that webhook config file ships only in pkg/kube; the witness has no
-# need for it (no workload pods to authenticate, only cluster-membership
-# operations).
-kubelet-arg:
-  - "node-status-update-frequency=2s"
-  - "cpu-manager-policy=static"
-  - "cpu-manager-reconcile-period=5s"
-  - "reserved-cpus=0"
-  # pkg/kube's kubelet already owns *:10250. We can't bind specific-IP:10250
-  # while another process holds 0.0.0.0:10250 — move the witness kubelet
-  # to a different port and tell the apiserver to dial it there (see
-  # kube-apiserver-arg kubelet-port below).
-  - "port=10350"
-  # Kubelet's healthz also defaults to 127.0.0.1:10248 — collides with
-  # pkg/kube's kubelet. Move ours off-default. Non-fatal if not moved
-  # (kubelet runs without healthz), but it's noisy and breaks liveness
-  # probing the witness's kubelet specifically.
-  - "healthz-port=10448"
+# Controller-manager + apiserver tuning matched to pkg/kube. With
+# --disable-agent there's no kubelet to tune, so the entire kubelet-arg
+# block is gone (was: node-status-update-frequency, cpu-manager-policy,
+# cpu-manager-reconcile-period, reserved-cpus). Likewise node-taint is
+# gone (no Node to taint), as is container-runtime-endpoint /
+# default-local-storage-path (no kubelet means no pod runtime, no PVs).
 kube-controller-arg:
   - "node-monitor-period=10s"
   - "node-monitor-grace-period=40s"
-  # pkg/kube's controller-manager already owns 127.0.0.1:10257 (the default).
-  # Move ours to a different port to avoid "bind: address already in use".
-  - "secure-port=10357"
 kube-apiserver-arg:
   - "event-ttl=72h"
-  # Force the apiserver to talk to OUR etcd by IP (not 127.0.0.1). The
-  # loopback listener is shared with pkg/kube's etcd via SO_REUSEPORT and
-  # connections get round-robined to the wrong process — half the time
-  # we end up at pkg/kube's etcd, get "unknown authority" (different CA),
-  # and bootstrap fails. This override avoids the apiserver side of that.
-  - "etcd-servers=https://10.244.240.5:2379"
-  # Match the kubelet port shift in kubelet-arg above. Apiserver dials
-  # kubelet at this port for log/exec/portforward proxying.
-  - "kubelet-port=10350"
-
-# kube-scheduler also defaults to 127.0.0.1:10259 — pkg/kube already owns
-# that. Shift to a witness-unique port.
-kube-scheduler-arg:
-  - "secure-port=10359"
-
-# kube-proxy ports (only relevant when kube-proxy is enabled — Phase 2
-# join requires matching pkg/kube's kube-proxy=on). Both default to
-# 127.0.0.1, both collide with pkg/kube's kube-proxy.
-kube-proxy-arg:
-  - "healthz-bind-address=127.0.0.1:10356"
-  - "metrics-bind-address=127.0.0.1:10349"

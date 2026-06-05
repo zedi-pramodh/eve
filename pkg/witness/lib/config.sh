@@ -18,8 +18,13 @@ WITNESS_NODE_NAME="eve-witness"
 # pkg/kube's k3s on the real interface.
 # shellcheck disable=SC2034
 WITNESS_NODE_IP="10.244.244.244"
+# WITNESS_IFACE semantics changed in Phase 1.5: this is now the PARENT
+# interface for the macvlan child that gets created inside the eve-witness
+# netns. Default eth0 = the cluster interface on most EVE devices.
+# (In Phase 1 this was the dummy interface name `eve-witness0`; that
+# concept no longer exists once k3s runs inside the netns.)
 # shellcheck disable=SC2034
-WITNESS_IFACE="eve-witness0"
+WITNESS_IFACE="eth0"
 
 # Manual override for Phase 2 dry-runs (cluster IP + real interface +
 # cluster join inputs), without rebuilding the image. Drop a shell-syntax

@@ -56,6 +56,101 @@ wait_for_default_route() {
     return 1
 }
 
+# Create the eve-witness network namespace and a macvlan child interface
+# of the cluster interface. Idempotent across container restarts/reboots
+# (the netns survives on host /run/netns/ as long as something keeps the
+# bind-mount alive).
+#
+# Inputs (from lib/config.sh + /persist/witness-override.env):
+#   WITNESS_NODE_IP, WITNESS_NODE_PREFIX, WITNESS_IFACE, WITNESS_GATEWAY
+#
+# Notes:
+# - pkg/witness service has `rootfsPropagation: shared` + `/run:/run` bind,
+#   which makes the bind-mount that `ip netns add` creates at /run/netns/X
+#   propagate to host. (Onboot containers don't honour these — that's why
+#   the earlier onboot-based attempt failed.)
+# - We deliberately do NOT switch the witness process into this netns
+#   here. Phase 1.5 step 1 just creates the netns; step 2 moves k3s into
+#   it via build.yml `net: eve-witness`.
+WITNESS_NETNS="eve-witness"
+WITNESS_VETH_NETNS="wit-eth0"   # peer name INSIDE the netns
+WITNESS_VETH_HOST="wit-host"    # peer name in host netns (no IP, no bridge)
+
+# Phase 1.5 networking choice — plain veth pair, NOT attached to any
+# EVE-managed bridge (eth0, cni0, bn1, etc.).
+#
+# History / why we don't macvlan eth0:
+# We initially tried `ip link add wit-eth0 link eth0 type macvlan mode
+# bridge` to give the witness a real L2 endpoint on the cluster network.
+# That broke the device — `eth0` in EVE is actually a Linux bridge owned
+# by pillar (with the physical NIC keth0 as its only port), and macvlan
+# children of a bridge cause traffic disruption that took eth0 down.
+#
+# Plain veth-pair with no bridge attachment:
+#   - Touches zero pillar-managed interfaces. Safe.
+#   - Witness inside the netns has WITNESS_NODE_IP on wit-eth0, can reach
+#     ITSELF and apiserver/etcd bound to that IP from inside the netns.
+#   - No external connectivity — but Phase 1.5 standalone doesn't need it
+#     (cordoned + tainted node never pulls images, no DNS lookups).
+#   - For Phase 2 join later, we'll add a separate connectivity step
+#     (probably bridge the host end into a pillar-coordinated subnet or
+#     have pillar set up the attachment per ENC).
+setup_witness_netns() {
+    logmsg "setup_witness_netns: ip=$WITNESS_NODE_IP (Phase 1.5 standalone via plain veth, NO bridge attachment)"
+
+    # 1. Create the netns if it doesn't exist.
+    if ! ip netns list | awk '{print $1}' | grep -qx "$WITNESS_NETNS"; then
+        if ! ip netns add "$WITNESS_NETNS"; then
+            logmsg "ERROR: ip netns add $WITNESS_NETNS failed"
+            return 1
+        fi
+        logmsg "Created netns $WITNESS_NETNS"
+    fi
+
+    # 2. Create the veth pair (host side + netns side) if not present, and
+    #    move the netns side into the netns.
+    if ! ip netns exec "$WITNESS_NETNS" ip link show "$WITNESS_VETH_NETNS" >/dev/null 2>&1; then
+        # Clean up any stale host-side veth from a prior attempt.
+        ip link show "$WITNESS_VETH_HOST"  >/dev/null 2>&1 && ip link del "$WITNESS_VETH_HOST"  2>/dev/null
+        ip link show "$WITNESS_VETH_NETNS" >/dev/null 2>&1 && ip link del "$WITNESS_VETH_NETNS" 2>/dev/null
+        if ! ip link add "$WITNESS_VETH_HOST" type veth peer name "$WITNESS_VETH_NETNS"; then
+            logmsg "ERROR: ip link add veth pair failed"
+            return 1
+        fi
+        ip link set "$WITNESS_VETH_NETNS" netns "$WITNESS_NETNS"
+        logmsg "Created veth pair ($WITNESS_VETH_HOST <-> $WITNESS_VETH_NETNS) and moved netns side into $WITNESS_NETNS"
+    fi
+
+    # 3. Host-side end stays in host netns, brought UP but UNATTACHED to
+    #    any bridge (intentional — keeps us off pillar's eth0/bn1/cni0).
+    ip link set "$WITNESS_VETH_HOST" up 2>/dev/null
+
+    # 4. Inside the netns: assign IP, bring iface + loopback up.
+    if ! ip netns exec "$WITNESS_NETNS" ip addr show dev "$WITNESS_VETH_NETNS" | grep -qw "$WITNESS_NODE_IP"; then
+        ip netns exec "$WITNESS_NETNS" ip addr add "${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32}" dev "$WITNESS_VETH_NETNS"
+        logmsg "Assigned ${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32} to $WITNESS_VETH_NETNS"
+    fi
+    ip netns exec "$WITNESS_NETNS" ip link set "$WITNESS_VETH_NETNS" up
+    ip netns exec "$WITNESS_NETNS" ip link set lo up
+
+    # Stub default route. flannel's GetDefaultGatewayInterface() walks
+    # /proc/net/route looking for a 0.0.0.0/0 entry to pick its public
+    # interface; without one it exits with "Unable to find default route"
+    # and k3s shuts down. The witness is single-node + cordoned + tainted,
+    # so vxlan endpoints get created but no traffic ever flows over them —
+    # the route just needs to *exist*, not actually reach anywhere. `ip
+    # route replace` is idempotent across container restarts.
+    #
+    # Phase 2 will REPLACE this stub with a real route to the seed when
+    # the witness joins an existing cluster (via pillar-coordinated
+    # bridge attachment or similar). Until then, this is purely to
+    # appease flannel's startup check.
+    ip netns exec "$WITNESS_NETNS" ip route replace default dev "$WITNESS_VETH_NETNS"
+
+    logmsg "setup_witness_netns: done"
+    return 0
+}
+
 # Create a dummy interface that carries the reserved witness IP
 # (10.244.244.244). This is what lets the witness's k3s bind apiserver/etcd
 # on the same default ports as pkg/kube's k3s — they're distinguished by IP,

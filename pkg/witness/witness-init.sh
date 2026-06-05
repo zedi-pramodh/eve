@@ -5,25 +5,43 @@
 #
 # pkg/witness entrypoint.
 #
-# Phase 1 ONLY — this script proves the package builds and bootstraps:
-#   - cgroup / module / vault prereqs
-#   - dummy interface eve-witness0 with the reserved 10.244.244.244 IP
-#   - /persist/vault/witness bind-mounted onto /var/lib (persistent state)
-#   - k3s downloaded and unpacked under /var/lib/k3s/bin
-#   - witness-private containerd at /run/witness/containerd/containerd.sock
-#   - k3s server in dedicated-etcd-node mode:
-#       * apiserver / controller-manager / scheduler DISABLED (config.yaml)
-#       * kubelet ENABLED — embedded etcd needs a Node object for cluster
-#         membership tracking, so --disable-agent is NOT used
-#       * kube-proxy + flannel disabled (config.yaml); workloads kept off
-#         by NoSchedule + NoExecute taints
-#   - Witness's k3s binds to 10.244.244.244 (node-ip), so kubelet :10250,
-#     etcd :2379/:2380 all live on the dummy interface — no collision with
-#     pkg/kube's k3s on the seed's real interface.
+# Phase 1.5 layout — TWO STAGES separated by a netns re-exec:
 #
-# Phase 2 (not in this script): read EdgeNodeClusterStatus, render
-# 01-clusterconfig.yaml with server/token, and join the seed's cluster as
-# the third etcd member.
+#   Stage A (host netns, this container's default):
+#     - cgroup / module / route / vault prereqs (setup_prereqs)
+#     - bind-mount /persist/vault/witness onto /var/lib (persistent state)
+#     - k3s downloaded + unpacked under /var/lib/k3s/bin (install_k3s)
+#         ^ NEEDS host networking to curl https://get.k3s.io
+#     - config.yaml.d/02-witness-network.yaml (node-ip) rendered
+#     - config.yaml.d/01-clusterconfig.yaml (join server+token) rendered
+#       when WITNESS_JOIN_URL is set in /persist/witness-override.env
+#     - eve-witness netns + veth pair (wit-host <-> wit-eth0) created
+#
+#   re-exec via `nsenter --net=/var/run/netns/eve-witness -- "$0" "$@"`
+#
+#   Stage B (eve-witness netns):
+#     - witness-private containerd at /run/witness/containerd/containerd.sock
+#     - k3s server (standalone Phase 1.5 or joining a cluster)
+#     - cordon_witness_node (backgrounded) — marks the Node
+#       Ready,SchedulingDisabled once it registers
+#
+# Why two stages?
+#
+# The eve-witness netns has NO default route (Phase 1.5 chose plain veth
+# with no bridge attachment — see witness-utils.sh:setup_witness_netns).
+# So anything that needs external connectivity (the k3s installer's curl,
+# DNS, etc.) MUST run before we re-exec into the netns. Persistent state
+# (mounts, /var/lib bind, cgroup setup) also lives in the mount namespace,
+# which nsenter --net=... does NOT switch — so all of those operations
+# stay visible inside the netns exactly as Stage A set them up.
+#
+# Why nsenter --net=<path> and not `ip netns exec`?
+#
+# `ip netns exec` internally does an extra `unshare(CLONE_NEWNS)` and
+# remounts /sys, which hides the /sys/fs/cgroup bind-mount we inherited
+# from the witness linuxkit service. k3s then dies with "cgroups: cgroup
+# mountpoint does not exist". nsenter --net preserves the mount namespace
+# entirely.
 
 # shellcheck source=pkg/witness/witness-utils.sh
 . /usr/bin/witness-utils.sh
@@ -54,13 +72,6 @@ setup_prereqs() {
     setup_cgroup
 
     wait_for_default_route
-
-    # Create the dummy interface BEFORE k3s starts — node-ip requires the
-    # IP to already exist on a local interface.
-    while ! setup_witness_interface; do
-        logmsg "Retrying setup_witness_interface in 5s"
-        sleep 5
-    done
 
     # Vault must be unsealed before we bind-mount /var/lib — the source
     # path /persist/vault/witness lives inside the encrypted vault.
@@ -102,7 +113,7 @@ start_k3s_once() {
             --node-name eve-witness \
             >> "${K3S_LOG_DIR}/${WITNESS_LOG_FILE}" 2>&1 &
     else
-        logmsg "Phase 1 standalone — using --cluster-init"
+        logmsg "Phase 1.5 standalone — using --cluster-init"
         nohup /usr/bin/k3s server \
             --node-name eve-witness \
             --cluster-init \
@@ -120,47 +131,68 @@ start_k3s_once() {
     return 0
 }
 
-DATESTR=$(date)
-mkdir -p "$K3S_LOG_DIR"
-echo "========================== $DATESTR ==========================" >> "$INSTALL_LOG"
-logmsg "pkg/witness starting up (node=${WITNESS_NODE_NAME} ip=${WITNESS_NODE_IP})"
+# =====================================================================
+# Stage A — host netns. Runs once per container start. Ends with a
+# re-exec into the eve-witness netns; nothing below the `exec nsenter`
+# at the bottom of this block runs in Stage A.
+# =====================================================================
+if [ "${WITNESS_IN_NETNS:-no}" != "yes" ]; then
+    DATESTR=$(date)
+    mkdir -p "$K3S_LOG_DIR" /run/witness
+    echo "========================== $DATESTR ==========================" >> "$INSTALL_LOG"
+    logmsg "pkg/witness Stage A (host netns) starting (node=${WITNESS_NODE_NAME} ip=${WITNESS_NODE_IP})"
 
-setup_prereqs
+    setup_prereqs
 
-# Install k3s (with retry — first boot may not have DNS yet). This also
-# triggers k3s's self-extraction of /var/lib/rancher/k3s/data/current/bin/
-# which gives us the containerd + runc + shim binaries we need below.
-while ! install_k3s; do
-    logmsg "k3s install failed, retrying in 10s"
-    sleep 10
-done
-logmsg "k3s ${K3S_VERSION} installed under /var/lib/k3s/bin"
+    # Install k3s (with retry — first boot may not have DNS yet). This also
+    # triggers k3s's self-extraction of /var/lib/rancher/k3s/data/current/bin/
+    # which gives us the containerd + runc + shim binaries we need below.
+    # MUST run in host netns: curl needs the host default route.
+    while ! install_k3s; do
+        logmsg "k3s install failed, retrying in 10s"
+        sleep 10
+    done
+    logmsg "k3s ${K3S_VERSION} installed under /var/lib/k3s/bin"
 
-# Render the dynamic node-ip overlay BEFORE the supervisor loop launches
-# k3s. If /persist/witness-override.env set a new WITNESS_NODE_IP, that
-# value is what lands in config.yaml.d/02-witness-network.yaml here, and
-# what k3s binds to on its first start.
-render_witness_network_config
+    # Render the dynamic node-ip overlay BEFORE the supervisor loop launches
+    # k3s. If /persist/witness-override.env set a new WITNESS_NODE_IP, that
+    # value is what lands in config.yaml.d/02-witness-network.yaml here, and
+    # what k3s binds to on its first start.
+    render_witness_network_config
 
-# If WITNESS_JOIN_URL / WITNESS_JOIN_TOKEN are set in the override file,
-# write the join overlay (server + token) to config.yaml.d/01-clusterconfig.yaml.
-# When unset, this also clears any stale join overlay from a prior boot so
-# the witness reverts to Phase 1 standalone cleanly.
-render_witness_cluster_config
+    # If WITNESS_JOIN_URL / WITNESS_JOIN_TOKEN are set in the override file,
+    # write the join overlay (server + token) to config.yaml.d/01-clusterconfig.yaml.
+    # When unset, this also clears any stale join overlay from a prior boot so
+    # the witness reverts to Phase 1.5 standalone cleanly.
+    render_witness_cluster_config
 
-# Drop a loopback-only CNI stub for kubelet. Without ANY conflist in
-# /etc/cni/net.d, kubelet reports NetworkPluginNotReady and the Node
-# stays NotReady. The witness never runs pods (cordoned + tainted), so a
-# no-op CNI is sufficient.
-render_witness_cni_stub
+    # Create the netns + veth pair. MUST run in host netns: `ip netns add`
+    # binds /proc/<pid>/ns/net into /var/run/netns/ which itself requires
+    # being in the host netns. setup_witness_netns is idempotent across
+    # container restarts (netns survives in host /run/netns/ until reboot).
+    if ! setup_witness_netns; then
+        logmsg "FATAL: setup_witness_netns failed"
+        echo "FATAL: setup_witness_netns failed; cannot start witness in isolated netns" >&2
+        exit 1
+    fi
 
-# Cordon the witness Node as soon as it registers. Backgrounded so the
-# supervisor loop below isn't blocked waiting for the apiserver/Node to
-# come up. cordon_witness_node polls up to 5 minutes for the Node object
-# and the local kubeconfig; once both are ready, it issues `kubectl cordon`
-# and exits. The config.yaml taints already block scheduling — this is the
-# operator-visible reinforcement (STATUS shows SchedulingDisabled).
-( cordon_witness_node ) &
+    export WITNESS_IN_NETNS=yes
+    logmsg "Stage A complete; re-execing into eve-witness netns for Stage B"
+    exec nsenter --net=/var/run/netns/eve-witness -- "$0" "$@"
+fi
+
+# =====================================================================
+# Stage B — inside the eve-witness netns. Only the supervised services
+# (containerd + k3s) live here.
+# =====================================================================
+logmsg "pkg/witness Stage B (eve-witness netns) starting"
+
+# Note: there is no cordon_witness_node call here in --disable-agent
+# mode. The witness has no Node object to cordon (and never will —
+# kubelet is disabled). See config.yaml's long comment block for the
+# architectural rationale. The cordon_witness_node function is kept
+# in witness-utils.sh for now as it does no harm dead-code-wise, but
+# nothing calls it.
 
 # Main supervision loop.
 #
