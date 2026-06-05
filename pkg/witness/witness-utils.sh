@@ -73,32 +73,61 @@ wait_for_default_route() {
 #   here. Phase 1.5 step 1 just creates the netns; step 2 moves k3s into
 #   it via build.yml `net: eve-witness`.
 WITNESS_NETNS="eve-witness"
-WITNESS_VETH_NETNS="wit-eth0"   # peer name INSIDE the netns
-WITNESS_VETH_HOST="wit-host"    # peer name in host netns (no IP, no bridge)
+WITNESS_VETH_NETNS="wit-eth0"   # interface name INSIDE the netns (both modes)
+WITNESS_VETH_HOST="wit-host"    # host-side veth peer name (standalone only)
 
-# Phase 1.5 networking choice — plain veth pair, NOT attached to any
-# EVE-managed bridge (eth0, cni0, bn1, etc.).
+# Set up the eve-witness network namespace and its sole interface
+# (wit-eth0). Both Phase 1.5 and Phase 2 use a plain veth pair; the only
+# difference is what wit-host (the host-side end) attaches to:
 #
-# History / why we don't macvlan eth0:
-# We initially tried `ip link add wit-eth0 link eth0 type macvlan mode
-# bridge` to give the witness a real L2 endpoint on the cluster network.
-# That broke the device — `eth0` in EVE is actually a Linux bridge owned
-# by pillar (with the physical NIC keth0 as its only port), and macvlan
-# children of a bridge cause traffic disruption that took eth0 down.
+#   Phase 1.5 (WITNESS_JOIN_URL unset — standalone):
+#     wit-host is in host netns, UP but with no IP and no bridge
+#     attachment. Witness is unreachable from outside the host — fine
+#     for a self-contained single-member etcd cluster.
 #
-# Plain veth-pair with no bridge attachment:
-#   - Touches zero pillar-managed interfaces. Safe.
-#   - Witness inside the netns has WITNESS_NODE_IP on wit-eth0, can reach
-#     ITSELF and apiserver/etcd bound to that IP from inside the netns.
-#   - No external connectivity — but Phase 1.5 standalone doesn't need it
-#     (cordoned + tainted node never pulls images, no DNS lookups).
-#   - For Phase 2 join later, we'll add a separate connectivity step
-#     (probably bridge the host end into a pillar-coordinated subnet or
-#     have pillar set up the attachment per ENC).
+#   Phase 2 (WITNESS_JOIN_URL set — join mode):
+#     wit-host is attached as a port on WITNESS_IFACE (the EVE cluster
+#     bridge — `eth0` by default). This puts wit-eth0 on the same L2
+#     segment as the host's cluster IP, allowing the witness to reach
+#     the seed (same-host) AND any other physical node on the cluster
+#     L2 (cross-host). WITNESS_GATEWAY is optional — only needed if
+#     the witness will talk to anything outside its immediate subnet.
+#
+# Why bridge-port and not macvlan:
+#   - macvlan-of-eth0 (the bridge): macvlan children of a Linux bridge
+#     cause traffic disruption. We tried and it took eth0 offline.
+#   - macvlan-of-keth0 (the physical NIC): works for a witness on a
+#     SEPARATE physical device, but fails on the same-host case where
+#     witness and seed share a wire — kernel refuses to deliver frames
+#     from a macvlan child to the parent NIC's host IP. The seed running
+#     on the host stack of the same NIC would be unreachable from the
+#     witness inside the netns.
+#   - Bridge-port attachment: a Linux bridge naturally forwards frames
+#     between all its ports including the bridge's own host-stack
+#     interface (eth0 itself). Works for both same-host and cross-host.
+#
+# Pillar coordination: pillar manages eth0 the bridge in EVE. Adding
+# wit-host as a foreign port is a standard kernel op; pillar may or
+# may not detect+evict it. If pillar does evict the port post-boot,
+# witness's connectivity to the cluster breaks until next container
+# restart. We'd need a watchdog that re-adds the port — out of scope
+# for the initial join implementation; document as a known risk.
+#
+# Tear down + recreate on every Stage-A run rather than checking for
+# matching existing config. Costs a few ms of `ip link` churn but
+# guarantees correctness when mode flips between boots.
 setup_witness_netns() {
-    logmsg "setup_witness_netns: ip=$WITNESS_NODE_IP (Phase 1.5 standalone via plain veth, NO bridge attachment)"
+    local mode
+    if [ -n "${WITNESS_JOIN_URL:-}" ]; then
+        mode="join"
+    else
+        mode="standalone"
+    fi
+    logmsg "setup_witness_netns: mode=$mode ip=${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32} bridge=${WITNESS_IFACE:-<unused>}"
 
-    # 1. Create the netns if it doesn't exist.
+    # 1. Create the netns if missing. The netns itself persists across
+    #    container restarts (lives in /run/netns/ which is bind-mounted
+    #    from host); we just need to ensure it exists.
     if ! ip netns list | awk '{print $1}' | grep -qx "$WITNESS_NETNS"; then
         if ! ip netns add "$WITNESS_NETNS"; then
             logmsg "ERROR: ip netns add $WITNESS_NETNS failed"
@@ -107,47 +136,150 @@ setup_witness_netns() {
         logmsg "Created netns $WITNESS_NETNS"
     fi
 
-    # 2. Create the veth pair (host side + netns side) if not present, and
-    #    move the netns side into the netns.
-    if ! ip netns exec "$WITNESS_NETNS" ip link show "$WITNESS_VETH_NETNS" >/dev/null 2>&1; then
-        # Clean up any stale host-side veth from a prior attempt.
-        ip link show "$WITNESS_VETH_HOST"  >/dev/null 2>&1 && ip link del "$WITNESS_VETH_HOST"  2>/dev/null
-        ip link show "$WITNESS_VETH_NETNS" >/dev/null 2>&1 && ip link del "$WITNESS_VETH_NETNS" 2>/dev/null
-        if ! ip link add "$WITNESS_VETH_HOST" type veth peer name "$WITNESS_VETH_NETNS"; then
-            logmsg "ERROR: ip link add veth pair failed"
+    # 2. Tear down any existing wit-eth0 inside the netns + any stale
+    #    host-side wit-host. Idempotent (no-op if already absent).
+    #    Deleting wit-eth0 inside the netns also cleans up the veth
+    #    peer in host netns automatically.
+    ip netns exec "$WITNESS_NETNS" ip link del "$WITNESS_VETH_NETNS" 2>/dev/null
+    ip link del "$WITNESS_VETH_HOST" 2>/dev/null
+
+    # 3. Create the veth pair (same in both modes).
+    if ! ip link add "$WITNESS_VETH_HOST" type veth peer name "$WITNESS_VETH_NETNS"; then
+        logmsg "ERROR: ip link add veth pair failed"
+        return 1
+    fi
+    ip link set "$WITNESS_VETH_NETNS" netns "$WITNESS_NETNS"
+    logmsg "Created veth pair ($WITNESS_VETH_HOST <-> $WITNESS_VETH_NETNS)"
+
+    # 4. Host-side attachment differs per mode.
+    if [ "$mode" = "join" ]; then
+        # Defensive: WITNESS_IFACE must be set AND must be a Linux
+        # bridge. Validating these here gives a clear error message
+        # instead of an opaque `ip link set master` failure later.
+        if [ -z "${WITNESS_IFACE:-}" ]; then
+            logmsg "ERROR: WITNESS_IFACE not set; required for join mode (must be the cluster bridge name, typically 'eth0')"
             return 1
         fi
-        ip link set "$WITNESS_VETH_NETNS" netns "$WITNESS_NETNS"
-        logmsg "Created veth pair ($WITNESS_VETH_HOST <-> $WITNESS_VETH_NETNS) and moved netns side into $WITNESS_NETNS"
+        if ! ip link show "$WITNESS_IFACE" >/dev/null 2>&1; then
+            logmsg "ERROR: WITNESS_IFACE=$WITNESS_IFACE does not exist on the host"
+            return 1
+        fi
+        # Bridge detection via netlink (ip -d link), NOT via
+        # /sys/class/net/<iface>/bridge directory test. The /sys path
+        # only works from the host's mount namespace; inside the
+        # witness container, /sys is mounted independently and the
+        # bridge subdirectory is not always exposed even when the
+        # interface is in fact a Linux bridge in the kernel. Netlink
+        # queries always reflect the kernel's view of the interface
+        # type, regardless of sysfs presentation.
+        if ! ip -d link show "$WITNESS_IFACE" 2>/dev/null | grep -q "bridge_id"; then
+            logmsg "ERROR: WITNESS_IFACE=$WITNESS_IFACE is not a Linux bridge. Phase 2 requires a bridge (typically EVE's eth0) so wit-host can be attached as a port. Available bridges on this host:"
+            for iface in $(ip -o link show 2>/dev/null | awk -F': ' '{print $2}' | awk '{print $1}'); do
+                if ip -d link show "$iface" 2>/dev/null | grep -q "bridge_id"; then
+                    logmsg "  - $iface"
+                fi
+            done
+            logmsg "Set WITNESS_IFACE in /persist/witness-override.env to one of the above."
+            return 1
+        fi
+        # Attach wit-host as a port of the cluster bridge.
+        if ! ip link set "$WITNESS_VETH_HOST" master "$WITNESS_IFACE"; then
+            logmsg "ERROR: failed to attach $WITNESS_VETH_HOST to bridge $WITNESS_IFACE"
+            return 1
+        fi
+        ip link set "$WITNESS_VETH_HOST" up
+        logmsg "Attached $WITNESS_VETH_HOST as a port of bridge $WITNESS_IFACE"
+    else
+        # Standalone mode: wit-host UP but unattached (no cluster reach).
+        ip link set "$WITNESS_VETH_HOST" up
+        logmsg "wit-host UP, not attached to any bridge (standalone)"
     fi
 
-    # 3. Host-side end stays in host netns, brought UP but UNATTACHED to
-    #    any bridge (intentional — keeps us off pillar's eth0/bn1/cni0).
-    ip link set "$WITNESS_VETH_HOST" up 2>/dev/null
-
-    # 4. Inside the netns: assign IP, bring iface + loopback up.
-    if ! ip netns exec "$WITNESS_NETNS" ip addr show dev "$WITNESS_VETH_NETNS" | grep -qw "$WITNESS_NODE_IP"; then
-        ip netns exec "$WITNESS_NETNS" ip addr add "${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32}" dev "$WITNESS_VETH_NETNS"
-        logmsg "Assigned ${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32} to $WITNESS_VETH_NETNS"
-    fi
+    # 5. Assign IP and bring interfaces up inside the netns.
+    ip netns exec "$WITNESS_NETNS" ip addr add "${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32}" dev "$WITNESS_VETH_NETNS"
     ip netns exec "$WITNESS_NETNS" ip link set "$WITNESS_VETH_NETNS" up
     ip netns exec "$WITNESS_NETNS" ip link set lo up
+    logmsg "Assigned ${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32} to $WITNESS_VETH_NETNS"
 
-    # Stub default route. flannel's GetDefaultGatewayInterface() walks
-    # /proc/net/route looking for a 0.0.0.0/0 entry to pick its public
-    # interface; without one it exits with "Unable to find default route"
-    # and k3s shuts down. The witness is single-node + cordoned + tainted,
-    # so vxlan endpoints get created but no traffic ever flows over them —
-    # the route just needs to *exist*, not actually reach anywhere. `ip
-    # route replace` is idempotent across container restarts.
-    #
-    # Phase 2 will REPLACE this stub with a real route to the seed when
-    # the witness joins an existing cluster (via pillar-coordinated
-    # bridge attachment or similar). Until then, this is purely to
-    # appease flannel's startup check.
-    ip netns exec "$WITNESS_NETNS" ip route replace default dev "$WITNESS_VETH_NETNS"
+    # 6. Default route.
+    if [ "$mode" = "join" ] && [ -n "${WITNESS_GATEWAY:-}" ]; then
+        # Real gateway for join mode if provided. Useful if cluster
+        # traffic crosses subnets or if other services (DNS, etc.)
+        # outside the immediate /28 need to be reached. Not strictly
+        # required if all etcd peers are on-link in the same subnet.
+        if ! ip netns exec "$WITNESS_NETNS" ip route replace default via "$WITNESS_GATEWAY"; then
+            logmsg "ERROR: failed to set default route via $WITNESS_GATEWAY"
+            return 1
+        fi
+        logmsg "Default route via $WITNESS_GATEWAY"
+    else
+        # Stub default route (standalone, or join without explicit
+        # gateway). Harmless under --disable-agent.
+        ip netns exec "$WITNESS_NETNS" ip route replace default dev "$WITNESS_VETH_NETNS"
+    fi
 
-    logmsg "setup_witness_netns: done"
+    logmsg "setup_witness_netns: done (mode=$mode)"
+    return 0
+}
+
+# Detect and handle Phase 1.5 ↔ Phase 2 mode transitions. Compares the
+# current desired mode (computed from env vars) against the last-known
+# mode recorded in WITNESS_MODE_FILE. On mismatch, wipes the persistent
+# k3s server state so the next k3s start does a fresh cluster-init (in
+# standalone) or fresh join (in Phase 2). On match, no-op.
+#
+# Why this is necessary:
+#   - The witness's etcd db at /var/lib/rancher/k3s/server/db encodes
+#     its cluster bootstrap identity (cluster ID, peer URLs, certs).
+#     k3s cannot smoothly transition between standalone (its own
+#     cluster) and joining a different cluster — it'll fail to start
+#     with bootstrap conflicts or critical-config errors.
+#   - Same applies to a join URL change: if WITNESS_JOIN_URL flips to a
+#     different seed (e.g. after a cluster-reset on the seed side), the
+#     witness's existing CA / certs are no longer valid for the new
+#     cluster.
+#
+# The marker file content is `standalone` for Phase 1.5 standalone or
+# `joined:<URL>` for Phase 2 join — different URLs produce different
+# markers, so reseeding the cluster triggers a wipe automatically.
+#
+# Must be called from Stage A AFTER mount_witness_root (the marker lives
+# under /var/lib which is bind-mounted from /persist/vault/witness) and
+# BEFORE install_k3s (so install_k3s sees a clean state if we wiped).
+witness_check_mode_transition() {
+    local desired current
+    if [ -n "${WITNESS_JOIN_URL:-}" ]; then
+        desired="joined:${WITNESS_JOIN_URL}"
+    else
+        desired="standalone"
+    fi
+    current=$(cat "$WITNESS_MODE_FILE" 2>/dev/null || echo "")
+
+    if [ "$current" = "$desired" ]; then
+        logmsg "witness_check_mode_transition: mode unchanged ($desired); keeping existing cluster state"
+        return 0
+    fi
+
+    logmsg "witness_check_mode_transition: mode transition '${current:-<none>}' -> '$desired'; wiping k3s cluster state"
+
+    # Wipe the k3s server-side persistent state. /var/lib here is
+    # /persist/vault/witness, so this clears the etcd db, cluster CA,
+    # bootstrap certs, and rendered manifests permanently.
+    rm -rf /var/lib/rancher/k3s/server/db
+    rm -rf /var/lib/rancher/k3s/server/tls
+    rm -rf /var/lib/rancher/k3s/server/cred
+    rm -rf /var/lib/rancher/k3s/server/manifests
+    rm -rf /var/lib/rancher/k3s/agent
+    rm -f  /etc/rancher/k3s/k3s.yaml
+
+    # Update the marker. Write happens BEFORE k3s starts — meaning if
+    # k3s then fails to come up in the new mode, the next boot still
+    # sees "current mode = desired mode" and won't re-wipe. That's
+    # fine: the wipe is one-shot, and the supervisor's retry loop will
+    # eventually make k3s succeed (or operator sees the error in logs).
+    mkdir -p "$(dirname "$WITNESS_MODE_FILE")"
+    echo "$desired" > "$WITNESS_MODE_FILE"
+    logmsg "witness_check_mode_transition: wipe complete, marker updated to '$desired'"
     return 0
 }
 

@@ -144,6 +144,15 @@ if [ "${WITNESS_IN_NETNS:-no}" != "yes" ]; then
 
     setup_prereqs
 
+    # Detect Phase 1.5 ↔ Phase 2 mode transitions and wipe stale cluster
+    # state when the override file flips between standalone and a
+    # specific join URL (or between two different join URLs). MUST run
+    # after setup_prereqs (which mounts /var/lib from the vault — that's
+    # where both the mode marker and the k3s state live) and BEFORE
+    # install_k3s (no point re-extracting binaries onto a doomed db).
+    # No-op when the mode matches the marker.
+    witness_check_mode_transition
+
     # Install k3s (with retry — first boot may not have DNS yet). This also
     # triggers k3s's self-extraction of /var/lib/rancher/k3s/data/current/bin/
     # which gives us the containerd + runc + shim binaries we need below.
