@@ -144,12 +144,38 @@ setup_witness_netns() {
     ip link del "$WITNESS_VETH_HOST" 2>/dev/null
 
     # 3. Create the veth pair (same in both modes).
-    if ! ip link add "$WITNESS_VETH_HOST" type veth peer name "$WITNESS_VETH_NETNS"; then
+    #
+    # MAC pinning — derive a STABLE MAC from WITNESS_NODE_IP so the
+    # interface keeps the same L2 identity across container restarts.
+    # Default `ip link add type veth` generates a fresh random MAC on
+    # every call, which:
+    #   - invalidates ARP caches on every cluster peer at each restart
+    #   - causes traffic from peers using the stale MAC to silently
+    #     vanish until they re-ARP (asymmetric reachability for ~60-300s
+    #     per cycle, depending on each peer's ARP cache aging)
+    #
+    # MAC format: 02:WI:TN:<3 IP octets in hex>. The 02 prefix has the
+    # locally-administered bit set (no IEEE OUI conflict). "WI:TN" is
+    # 0x57:0x49:0x54:0x4E hex marker ("WITN" in ASCII) for grep-ability.
+    # We use only the last 3 octets of the IP so a /28 IP swap during
+    # Phase 2 cloud rotation produces a deterministically different MAC.
+    local ip_oct2 ip_oct3 ip_oct4 wit_mac
+    ip_oct2=$(printf '%02x' "$(echo "$WITNESS_NODE_IP" | cut -d. -f2)")
+    ip_oct3=$(printf '%02x' "$(echo "$WITNESS_NODE_IP" | cut -d. -f3)")
+    ip_oct4=$(printf '%02x' "$(echo "$WITNESS_NODE_IP" | cut -d. -f4)")
+    wit_mac="02:57:49:${ip_oct2}:${ip_oct3}:${ip_oct4}"
+    # Host-side MAC offset by setting the unicast bit differently —
+    # keep the same first 4 octets but flip a low bit so wit-host and
+    # wit-eth0 have distinct (but related) MACs.
+    local host_mac="06:57:49:${ip_oct2}:${ip_oct3}:${ip_oct4}"
+
+    if ! ip link add "$WITNESS_VETH_HOST" address "$host_mac" \
+                     type veth peer name "$WITNESS_VETH_NETNS" address "$wit_mac"; then
         logmsg "ERROR: ip link add veth pair failed"
         return 1
     fi
     ip link set "$WITNESS_VETH_NETNS" netns "$WITNESS_NETNS"
-    logmsg "Created veth pair ($WITNESS_VETH_HOST <-> $WITNESS_VETH_NETNS)"
+    logmsg "Created veth pair ($WITNESS_VETH_HOST [MAC $host_mac] <-> $WITNESS_VETH_NETNS [MAC $wit_mac])"
 
     # 4. Host-side attachment differs per mode.
     if [ "$mode" = "join" ]; then
@@ -189,6 +215,40 @@ setup_witness_netns() {
         fi
         ip link set "$WITNESS_VETH_HOST" up
         logmsg "Attached $WITNESS_VETH_HOST as a port of bridge $WITNESS_IFACE"
+
+        # Disable bridge-netfilter so frames forwarded between bridge
+        # ports (wit-host <-> keth0) are NOT processed by iptables.
+        #
+        # EVE pillar leaves /proc/sys/net/bridge/bridge-nf-call-iptables=1
+        # by default because it uses iptables to filter app traffic on
+        # the eth0 bridge. With that ON, frames between wit-host and
+        # keth0 traverse the FORWARD chain, and pillar's chain doesn't
+        # know about wit-host as a legitimate cluster bridge port —
+        # frames get silently dropped (manifests as etcd peers
+        # unreachable from the witness in both directions, with bridge
+        # FDB entries appearing correct and port flags identical to
+        # keth0; debugged this for hours).
+        #
+        # This is HOST-WIDE — disables bridge-netfilter for ALL bridges
+        # on this device, including any pillar-managed app traffic
+        # filtering on eth0. The witness can't work without it, but
+        # if pillar relies on bridge-nf for security policy across
+        # other interfaces, that policy is also disabled.
+        #
+        # Per-bridge override (/sys/class/net/eth0/bridge/nf_call_iptables=0)
+        # is INSUFFICIENT — observed empirically on EVE 6.12 kernels
+        # that traffic is still filtered when the global setting is 1.
+        #
+        # Phase 2 production needs pillar coordination: either pillar
+        # adds wit-host to its iptables FORWARD ACCEPT list, OR pillar
+        # publishes a "witness mode" flag that turns off bridge-nf-call
+        # in a more targeted way.
+        for sysctl in bridge-nf-call-iptables bridge-nf-call-ip6tables bridge-nf-call-arptables; do
+            if [ -w "/proc/sys/net/bridge/$sysctl" ]; then
+                echo 0 > "/proc/sys/net/bridge/$sysctl" || true
+            fi
+        done
+        logmsg "Disabled bridge-nf-call sysctls (required for wit-host bridge port to forward etcd traffic)"
     else
         # Standalone mode: wit-host UP but unattached (no cluster reach).
         ip link set "$WITNESS_VETH_HOST" up
@@ -200,6 +260,23 @@ setup_witness_netns() {
     ip netns exec "$WITNESS_NETNS" ip link set "$WITNESS_VETH_NETNS" up
     ip netns exec "$WITNESS_NETNS" ip link set lo up
     logmsg "Assigned ${WITNESS_NODE_IP}${WITNESS_NODE_PREFIX:-/32} to $WITNESS_VETH_NETNS"
+
+    # 5b. Gratuitous ARP — proactively announce witness's (stable) MAC
+    # to all cluster peers. Without this, peers that had us cached
+    # under a previous MAC (from an earlier boot/version that didn't
+    # pin MACs) would keep using the stale entry for up to ~5 minutes
+    # — which is the asymmetric-reachability bug Phase 2 tripped on.
+    # `arping -U` sends unsolicited announcements; if arping isn't
+    # available, the fallback ping-broadcast achieves the same effect.
+    # Failure is non-fatal: with a stable MAC, ARP entries will
+    # converge through normal ARP within minutes regardless.
+    if [ "$mode" = "join" ]; then
+        ip netns exec "$WITNESS_NETNS" arping -U -c 3 -I "$WITNESS_VETH_NETNS" \
+            "$WITNESS_NODE_IP" >/dev/null 2>&1 || \
+            ip netns exec "$WITNESS_NETNS" ping -b -c 1 -W 1 \
+                "${WITNESS_NODE_IP%.*}.255" >/dev/null 2>&1 || true
+        logmsg "Sent gratuitous ARP announcing $WITNESS_NODE_IP on $WITNESS_VETH_NETNS"
+    fi
 
     # 6. Default route.
     if [ "$mode" = "join" ] && [ -n "${WITNESS_GATEWAY:-}" ]; then
