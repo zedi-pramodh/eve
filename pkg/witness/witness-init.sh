@@ -209,7 +209,108 @@ logmsg "pkg/witness Stage B (eve-witness netns) starting"
 # (started by k3s) will try to dial WITNESS_CTRD_SOCK as soon as it boots.
 # check_start_containerd is idempotent — it's a no-op when our containerd
 # is already running.
+#
+# Dynamic join/leave (Phase 2+): every iteration we re-source
+# /persist/witness-override.env to pick up pillar's updates to
+# WITNESS_JOIN_URL. If the value changes between iterations, we transition
+# k3s state IN PLACE (no container exit — EVE's linuxkit does not
+# auto-respawn dead service containers, so we cannot rely on a "die +
+# respawn" pattern). Transitions:
+#
+#   - JOIN_URL set->unset   (joined cluster -> standalone):
+#       witness_leave_cluster() gracefully removes our etcd member from
+#       the cluster, stops k3s, wipes cluster state, updates marker to
+#       "standalone". render_witness_cluster_config removes the stale
+#       01-clusterconfig.yaml. Next start_k3s_once iteration launches
+#       k3s with --cluster-init (Phase 1.5 single-node behavior).
+#
+#   - JOIN_URL unset->set   (standalone -> joined cluster):
+#       Stop standalone k3s (SIGTERM with timeout), wipe standalone
+#       cluster state via witness_check_mode_transition, render new
+#       01-clusterconfig.yaml. Next start_k3s_once launches k3s with
+#       --server=<URL> (joins the named cluster).
+#
+#   - JOIN_URL changed      (joined cluster A -> joined cluster B):
+#       Treated as leave-then-join. Both operations are sequenced; the
+#       inter-cluster transition takes ~30-60s.
+#
+# Pillar (or operator) drives this by writing/clearing WITNESS_JOIN_URL
+# in /persist/witness-override.env when cluster topology dictates the
+# witness's role:
+#       2 physical nodes  ->  set JOIN_URL  ->  witness joins as 3rd vote
+#       3+ physical nodes ->  unset JOIN_URL ->  witness leaves, runs standalone
+#
+# Network configuration (bridge attachment, WITNESS_IFACE, WITNESS_GATEWAY,
+# sysctls) is set ONCE during Stage A and is NOT re-evaluated during
+# transitions. If pillar changes any of those mid-run, the witness must
+# be explicitly restarted (or rebooted) to apply them — they're device
+# topology, not mode flags.
+
+prev_join_url="${WITNESS_JOIN_URL:-}"
+prev_join_token="${WITNESS_JOIN_TOKEN:-}"
+
 while true; do
+    # Re-read the override file each iteration. Preserve previous
+    # values if the file has a syntax error so we don't trigger a
+    # spurious leave on a half-written file.
+    saved_join_url="${WITNESS_JOIN_URL:-}"
+    saved_join_token="${WITNESS_JOIN_TOKEN:-}"
+    unset WITNESS_JOIN_URL WITNESS_JOIN_TOKEN
+    if [ -r "$WITNESS_OVERRIDE_FILE" ]; then
+        if sh -n "$WITNESS_OVERRIDE_FILE" 2>/dev/null; then
+            # shellcheck source=/dev/null
+            . "$WITNESS_OVERRIDE_FILE"
+        else
+            logmsg "supervisor: WARN — $WITNESS_OVERRIDE_FILE has shell syntax errors; preserving previous values for this iteration"
+            WITNESS_JOIN_URL="$saved_join_url"
+            WITNESS_JOIN_TOKEN="$saved_join_token"
+        fi
+    fi
+    cur_join_url="${WITNESS_JOIN_URL:-}"
+
+    if [ "$prev_join_url" != "$cur_join_url" ]; then
+        # Mode transition detected. Branch on direction.
+        if [ -z "$cur_join_url" ] && [ -n "$prev_join_url" ]; then
+            # Joined ($prev_join_url) -> Standalone
+            logmsg "supervisor: WITNESS_JOIN_URL unset (was '$prev_join_url'), leaving cluster"
+            witness_leave_cluster
+            # Clear the rendered 01-clusterconfig.yaml so the next k3s
+            # start does NOT see a stale join overlay. With no JOIN_URL
+            # set, render_witness_cluster_config removes it.
+            render_witness_cluster_config
+        elif [ -n "$cur_join_url" ] && [ -z "$prev_join_url" ]; then
+            # Standalone -> Joined ($cur_join_url)
+            logmsg "supervisor: WITNESS_JOIN_URL set to '$cur_join_url', joining cluster"
+            # Stop current standalone k3s before wiping its state.
+            if [ -r "$WITNESS_K3S_PID_FILE" ]; then
+                pid=$(cat "$WITNESS_K3S_PID_FILE")
+                if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+                    logmsg "supervisor: stopping standalone k3s (pid=$pid)"
+                    kill -TERM "$pid" 2>/dev/null
+                    i=0
+                    while [ $i -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+                        sleep 1
+                        i=$((i + 1))
+                    done
+                    kill -KILL "$pid" 2>/dev/null
+                fi
+                rm -f "$WITNESS_K3S_PID_FILE"
+            fi
+            # Wipe standalone state + update marker.
+            witness_check_mode_transition
+            # Write the join overlay config (01-clusterconfig.yaml).
+            render_witness_cluster_config
+        else
+            # Joined ($prev_join_url) -> Joined ($cur_join_url) — different cluster.
+            logmsg "supervisor: WITNESS_JOIN_URL changed from '$prev_join_url' to '$cur_join_url', migrating"
+            witness_leave_cluster
+            # witness_leave_cluster set marker to standalone; now flip to new cluster.
+            witness_check_mode_transition
+            render_witness_cluster_config
+        fi
+        prev_join_url="$cur_join_url"
+    fi
+
     if ! check_start_containerd; then
         logmsg "containerd not ready, will retry"
         sleep 5

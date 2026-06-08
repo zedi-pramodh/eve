@@ -360,6 +360,159 @@ witness_check_mode_transition() {
     return 0
 }
 
+# Query the witness's local etcd to find OUR own member ID in the
+# cluster (the witness's etcd member, identified by name prefix
+# "eve-witness-*" — k3s appends a random suffix). Returns the ID as a
+# hex string on stdout, empty on failure.
+#
+# Used by witness_leave_cluster to know which member to remove. Must be
+# called while local k3s + etcd are still running (otherwise the local
+# endpoint won't answer).
+witness_get_local_member_id() {
+    local etcd_ca=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt
+    local etcd_cert=/var/lib/rancher/k3s/server/tls/etcd/client.crt
+    local etcd_key=/var/lib/rancher/k3s/server/tls/etcd/client.key
+
+    [ -r "$etcd_ca" ] && [ -r "$etcd_cert" ] && [ -r "$etcd_key" ] || return 1
+
+    etcdctl --dial-timeout=5s \
+        --endpoints="https://${WITNESS_NODE_IP}:2379" \
+        --cacert="$etcd_ca" --cert="$etcd_cert" --key="$etcd_key" \
+        member list -w json 2>/dev/null | \
+        jq -r '.members[] | select(.name | startswith("eve-witness")) | .ID' 2>/dev/null | \
+        head -1
+}
+
+# Gracefully leave a joined cluster:
+#   1. Remove our etcd member entry from the cluster (best-effort, two
+#      attempts: original join URL, then any non-self peer).
+#   2. Stop local k3s (SIGTERM then SIGKILL if needed).
+#   3. Wipe local cluster state so next k3s start does fresh
+#      --cluster-init (single-node standalone, Phase 1.5 mode).
+#   4. Update WITNESS_MODE_FILE marker to "standalone".
+#
+# After this returns, the supervisor loop in witness-init.sh will see
+# k3s not running, render_witness_cluster_config will clear the stale
+# join overlay (because WITNESS_JOIN_URL was unset), and start_k3s_once
+# will launch k3s in --cluster-init mode.
+#
+# Designed to be called from the Stage B supervisor loop when the
+# override file's WITNESS_JOIN_URL transitions from set → unset (pillar
+# signals "you're no longer needed for quorum"). Container is NOT
+# restarted — EVE's linuxkit does not auto-respawn dead service
+# containers, so all transitions must happen in place.
+#
+# Best-effort semantics: if the etcd MemberRemove fails (cluster
+# unreachable, all peer endpoints stale), we log a warning and proceed
+# with the local stop + wipe anyway. The cluster will then have an
+# orphan member entry that an operator can clean up manually.
+witness_leave_cluster() {
+    logmsg "witness_leave_cluster: initiating graceful leave"
+
+    # 1. Find our member ID while etcd is still alive locally.
+    local our_id
+    our_id=$(witness_get_local_member_id)
+    if [ -z "$our_id" ]; then
+        logmsg "witness_leave_cluster: WARN — could not determine local etcd member ID"
+    else
+        logmsg "witness_leave_cluster: our etcd member ID is $our_id"
+    fi
+
+    # 2. Read previous cluster URL from the mode marker.
+    local cluster_url="" marker_content
+    marker_content=$(cat "$WITNESS_MODE_FILE" 2>/dev/null || echo "")
+    case "$marker_content" in
+        joined:*) cluster_url="${marker_content#joined:}" ;;
+    esac
+
+    # 3. Attempt MemberRemove. Two attempts max, 5s timeout each.
+    local removed=0
+    if [ -n "$our_id" ]; then
+        local etcd_ca=/var/lib/rancher/k3s/server/tls/etcd/server-ca.crt
+        local etcd_cert=/var/lib/rancher/k3s/server/tls/etcd/client.crt
+        local etcd_key=/var/lib/rancher/k3s/server/tls/etcd/client.key
+
+        # Attempt 1: the URL we joined to (translate 6443 → 2379).
+        if [ -n "$cluster_url" ]; then
+            local endpoint
+            endpoint=$(echo "$cluster_url" | sed 's|:6443.*|:2379|')
+            logmsg "witness_leave_cluster: attempting MemberRemove via $endpoint"
+            if etcdctl --dial-timeout=5s --command-timeout=5s \
+                --endpoints="$endpoint" \
+                --cacert="$etcd_ca" --cert="$etcd_cert" --key="$etcd_key" \
+                member remove "$our_id" >> "$INSTALL_LOG" 2>&1; then
+                removed=1
+                logmsg "witness_leave_cluster: MemberRemove succeeded via $endpoint"
+            else
+                logmsg "witness_leave_cluster: MemberRemove via $endpoint failed; trying fallback peer"
+            fi
+        fi
+
+        # Attempt 2: pick a non-self peer from local etcd's view.
+        if [ "$removed" = "0" ]; then
+            local peer_endpoint
+            peer_endpoint=$(etcdctl --dial-timeout=5s \
+                --endpoints="https://${WITNESS_NODE_IP}:2379" \
+                --cacert="$etcd_ca" --cert="$etcd_cert" --key="$etcd_key" \
+                member list -w json 2>/dev/null | \
+                jq -r --arg us "$our_id" \
+                    '.members[] | select(.ID != ($us | tonumber)) | .clientURLs[0]' 2>/dev/null | \
+                head -1)
+            if [ -n "$peer_endpoint" ]; then
+                logmsg "witness_leave_cluster: fallback — attempting MemberRemove via $peer_endpoint"
+                if etcdctl --dial-timeout=5s --command-timeout=5s \
+                    --endpoints="$peer_endpoint" \
+                    --cacert="$etcd_ca" --cert="$etcd_cert" --key="$etcd_key" \
+                    member remove "$our_id" >> "$INSTALL_LOG" 2>&1; then
+                    removed=1
+                    logmsg "witness_leave_cluster: MemberRemove succeeded via $peer_endpoint"
+                fi
+            fi
+        fi
+
+        if [ "$removed" = "0" ]; then
+            logmsg "witness_leave_cluster: WARN — MemberRemove failed on all endpoints; cluster will have orphan member $our_id (operator should run 'etcdctl member remove $our_id' on a healthy cluster node)"
+        fi
+    fi
+
+    # 4. Stop local k3s gracefully (SIGTERM → wait 30s → SIGKILL).
+    if [ -r "$WITNESS_K3S_PID_FILE" ]; then
+        local pid
+        pid=$(cat "$WITNESS_K3S_PID_FILE")
+        if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+            logmsg "witness_leave_cluster: stopping local k3s (pid=$pid)"
+            kill -TERM "$pid" 2>/dev/null
+            local i=0
+            while [ $i -lt 30 ] && kill -0 "$pid" 2>/dev/null; do
+                sleep 1
+                i=$((i + 1))
+            done
+            if kill -0 "$pid" 2>/dev/null; then
+                logmsg "witness_leave_cluster: k3s didn't exit on SIGTERM after 30s, SIGKILL"
+                kill -KILL "$pid" 2>/dev/null
+                sleep 2
+            fi
+        fi
+        rm -f "$WITNESS_K3S_PID_FILE"
+    fi
+
+    # 5. Wipe local cluster state so the next k3s start --cluster-init's
+    #    cleanly without bootstrap conflicts from the prior cluster.
+    rm -rf /var/lib/rancher/k3s/server/db
+    rm -rf /var/lib/rancher/k3s/server/tls
+    rm -rf /var/lib/rancher/k3s/server/cred
+    rm -rf /var/lib/rancher/k3s/server/manifests
+    rm -rf /var/lib/rancher/k3s/agent
+    rm -f  /etc/rancher/k3s/k3s.yaml
+
+    # 6. Update marker.
+    mkdir -p "$(dirname "$WITNESS_MODE_FILE")"
+    echo "standalone" > "$WITNESS_MODE_FILE"
+
+    logmsg "witness_leave_cluster: complete; next k3s start will be standalone --cluster-init"
+    return 0
+}
+
 # Create a dummy interface that carries the reserved witness IP
 # (10.244.244.244). This is what lets the witness's k3s bind apiserver/etcd
 # on the same default ports as pkg/kube's k3s — they're distinguished by IP,

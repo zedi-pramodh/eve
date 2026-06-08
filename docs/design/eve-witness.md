@@ -1158,102 +1158,130 @@ After successful join:
   inside the netns) is not exposed to the cluster — apiservers talk
   to etcd directly, not through other apiservers.
 
-### 13.2 The L3 reachability problem
+### 13.2 The L3 reachability problem (IMPLEMENTED)
 
 Phase 1.5 left the witness completely unreachable from outside the
 host. The veth `wit-host` has no IP and is attached to no bridge.
 That's safe for a standalone witness, but **Phase 2 requires the
 seed's apiserver (and the other physical node) to dial the witness at
-`10.244.244.244:2380` (etcd peer)** for raft, AND requires the
-witness to dial back the seed's apiserver at `https://<seed-ip>:6443`
-for cluster bootstrap.
+`<witness-ip>:2380` (etcd peer)** for raft, AND requires the witness
+to dial back the seed's apiserver at `https://<seed-ip>:6443` for
+cluster bootstrap.
 
-Three feasible designs, ranked by recommended order to investigate:
+Three options were evaluated. We implemented Option B (bridge-port)
+after Option A turned out to be broken for the same-host case.
 
-**Option A — Macvlan child of `keth0` (the physical NIC), not `eth0` (the bridge).**
+**Option A — Macvlan child of `keth0` (physical NIC). REJECTED.**
 
-The Phase 1 attempt failed because `ip link add wit-eth0 link eth0
-type macvlan` made a macvlan child of the LINUX BRIDGE that EVE uses
-as `eth0`. Bridges fight macvlan. **`keth0` is the underlying physical
-NIC** (a bridge port, not a bridge), and macvlan children of a
-physical NIC are well-supported and don't disturb the bridge's
-operation.
+We initially planned this. The idea: `ip link add wit-eth0 link keth0
+type macvlan mode bridge`, giving the witness its own L2 endpoint on
+the cluster network without touching the eth0 bridge.
+
+What killed it: **macvlan-bridge children cannot talk to the parent
+NIC's own host stack** — it's a kernel-level rule, not a config knob.
+When the witness lives on the same physical box as the seed (which is
+the *only* deployment topology — witness exists *because* there are
+only 2 physical nodes), the seed's apiserver lives in the host stack
+on the same NIC. Frames from the witness's macvlan child destined for
+the host stack's IP get silently dropped by the kernel.
+
+Workable for a 3-physical-device cluster (witness on its own box), but
+useless for the actual use case.
+
+**Option B — Bridge-port attachment of `wit-host` onto `eth0`. IMPLEMENTED.**
 
 ```sh
-# Inside witness setup_witness_netns:
-ip link add wit-eth0 link keth0 type macvlan mode bridge
+# In setup_witness_netns (join mode):
+ip link add wit-host type veth peer name wit-eth0 address <host-mac> peer address <wit-mac>
 ip link set wit-eth0 netns eve-witness
-# Inside netns:
-ip addr add <witness-cluster-ip>/<prefix> dev wit-eth0
-ip route add default via <gateway>
-```
-
-The witness gets a real L2 endpoint on the cluster network. ARP
-resolves directly. No host bridge attachment. Seed and witness see
-each other as ordinary same-subnet peers.
-
-**Requires from cloud / pillar:**
-- A second cluster-routable IP for the witness (the "witness IP"
-  field in EdgeNodeClusterStatus — see §6.4).
-- That IP must be on the same subnet as the seed's `eth0`.
-- The MAC of `wit-eth0` (random by default) needs DHCP server
-  awareness if DHCP is in use; otherwise static config works.
-
-**Risks:**
-- macvlan-of-physical works in lab but EVE's keth0 may have driver
-  quirks (some intel/realtek combos). Test on real hardware before
-  betting on this.
-- macvlan-bridge children cannot talk to the parent's own host IP.
-  The seed's pkg/kube on `eth0` reaches the witness fine, but the
-  witness CAN'T reach the seed via the seed's `eth0` IP. Workaround:
-  the seed's `eth0` and the witness's `wit-eth0` are on the same L2;
-  use the seed's IP from the wider cluster broadcast domain — same
-  outcome.
-
-**Option B — Bridge `wit-host` into `eth0` the bridge.**
-
-Add the host-side veth as a port on `eth0` bridge:
-
-```sh
-ip link set wit-host master eth0
-# Then inside netns, give wit-eth0 an IP on eth0's subnet:
+ip link set wit-host master eth0       # ← bridge-port attachment
+ip link set wit-host up
 ip netns exec eve-witness ip addr add <witness-ip>/<prefix> dev wit-eth0
+ip netns exec eve-witness ip link set wit-eth0 up
+ip netns exec eve-witness ip route replace default via <gateway>
 ```
 
-This makes wit-eth0 indistinguishable from any other endpoint on
-eth0's broadcast domain. Pillar's zedrouter MIGHT react to a new port
-appearing on its bridge (deletes it, logs warnings, etc.) — needs
-investigation. If pillar tolerates it, this is the simplest design.
+Linux bridges forward frames between ALL their ports, *including* the
+bridge interface itself (the host stack). So both same-host
+(witness ↔ seed via the bridge) and cross-host (witness ↔ other-node
+via the wire) work transparently. No macvlan loopback restriction.
 
-**Risks:**
-- Pillar coordination. Zedrouter watches `eth0` and may un-add the
-  port or fight with us.
-- Cleaner if pillar grew a `WitnessAttachment` config field that
-  caused zedrouter to add wit-host as a permanent bridge port.
+`WITNESS_IFACE` semantics: must be a Linux bridge (typically EVE's
+`eth0`). `setup_witness_netns` validates this via `ip -d link show |
+grep bridge_id` (netlink-based — `/sys/class/net/<iface>/bridge`
+directory check is unreliable inside the witness container's sysfs
+view). If the operator misconfigures, the witness logs the list of
+available bridges and refuses to start.
 
-**Option C — L3 routing through `wit-host` (no bridge or macvlan).**
+**MAC pinning.** Default `ip link add type veth` generates a random
+MAC every time. That invalidates cluster peers' ARP caches on every
+witness restart, causing 60-300s of asymmetric reachability while
+caches age out. To fix this, we derive a stable MAC from
+`WITNESS_NODE_IP`:
 
-Use a separate subnet for the witness (e.g. `10.244.244.0/24`), put
-`10.244.244.1` on `wit-host` (host side), `10.244.244.244` on
-`wit-eth0` (witness side). Enable IP forwarding. The host routes
-between `eth0` and `wit-host`.
+```
+wit-eth0 (in netns) MAC = 02:57:49:<oct2>:<oct3>:<oct4>
+wit-host  (on bridge) MAC = 06:57:49:<oct2>:<oct3>:<oct4>
+```
 
-For external reachability, EVERY cluster node needs a route to
-`10.244.244.0/24` via the seed's `eth0` IP:
+The `02:` / `06:` prefixes have the locally-administered bit set (no
+IEEE OUI collision). `0x57:0x49 = "WI"` is a witness marker (grep-able
+in tcpdump output). The IP's last three octets vary per witness
+identity. Across all witness restarts with the same `WITNESS_NODE_IP`,
+the MAC stays identical.
+
+A gratuitous-ARP burst (`arping -U`) fires right after IP assignment
+to update peer caches eagerly — short-circuits the wait for stale
+entries to expire when the witness's MAC ever does change (e.g., during
+migration to a new IP).
+
+**The bridge-netfilter trap (discovered the hard way).**
+
+EVE pillar leaves `/proc/sys/net/bridge/bridge-nf-call-iptables=1`
+globally. With that on, frames forwarded between bridge ports
+*traverse iptables* (FORWARD chain in particular). Pillar's iptables
+chain (`INPUT-device`, `INPUT-apps`, and similar) doesn't know that
+`wit-host` is a legitimate cluster port — so cluster traffic from/to
+the witness via the bridge gets dropped silently. Symptom: TCP SYNs
+visible on `wit-host` (entering bridge) but **never** on `keth0`
+(exiting to wire); same in reverse. L2/ARP works fine (different
+codepath).
+
+Setting the per-bridge `/sys/class/net/eth0/bridge/nf_call_iptables=0`
+is NOT sufficient on EVE 6.12 kernels — observed empirically that
+traffic is still filtered when the global setting is 1. Disabling the
+three global sysctls is required:
 
 ```sh
-# On the OTHER physical node (the non-seed):
-ip route add 10.244.244.0/24 via <seed-eth0-ip> dev eth0
+echo 0 > /proc/sys/net/bridge/bridge-nf-call-iptables
+echo 0 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
+echo 0 > /proc/sys/net/bridge/bridge-nf-call-arptables
 ```
 
-This works but requires plumbing routes onto every cluster member,
-including ones EVE doesn't directly manage. **Likely the worst
-option** for an embedded-orchestrator product — the operator burden
-is too high.
+`setup_witness_netns` does this on every join-mode setup. **The change
+is host-wide**: it disables bridge-netfilter for ALL bridges on the
+device, including any pillar-managed app-traffic filtering on eth0.
+The witness can't function without it, but if pillar relies on
+bridge-nf for app-isolation security policy, that policy is also
+disabled.
 
-**Recommendation:** prototype Option A first. If keth0 macvlan
-performs reliably, that's the design. Fall back to Option B only if
-keth0 has driver issues. Option C is a last resort.
+Long-term Phase 2 production fix requires pillar coordination — one
+of:
+1. Pillar's iptables FORWARD chain adds explicit ACCEPT rules for
+   `wit-host` (allowing per-bridge bridge-nf-call to stay 0 while
+   keeping global bridge-nf-call=1 for app isolation).
+2. Pillar publishes a "witness mode" flag that toggles bridge-nf-call
+   per-bridge appropriately.
+3. Pillar coordinates the eth0 bridge configuration to include
+   wit-host as a known/trusted port.
+
+**Option C — L3 routing through `wit-host` (no bridge attachment).**
+
+Use a separate subnet for the witness; host acts as L3 router between
+eth0's subnet and the witness subnet. Every cluster member needs
+static routes pointing at the seed for the witness subnet. Operator
+burden is excessive for an embedded-orchestrator product. **Not
+implemented.**
 
 ### 13.3 Cloud-side contract (refined from §6)
 
@@ -1290,44 +1318,161 @@ keth0), pillar does NOT put the IP on eth0** — the IP lives only
 inside the netns on `wit-eth0`. Pillar/zedkube provide the IP value
 in EdgeNodeClusterStatus; the witness applies it itself.
 
-### 13.4 Witness-side flow
+### 13.4 Witness-side flow (IMPLEMENTED)
 
-1. **Detect ENC publication.** File-watch on
-   `/run/zedkube/EdgeNodeClusterStatus/global.json`. Or simpler:
-   re-read `/persist/witness-override.env` (the existing manual-test
-   path) and treat absence of `WITNESS_JOIN_URL` as Phase 1 standalone.
+Implemented as a combination of **Stage A** (one-time per container
+start) and **Stage B's supervisor loop** (continuous polling). The
+override file `/persist/witness-override.env` is the signal channel —
+pillar/zedkube (or the operator manually) writes/clears
+`WITNESS_JOIN_URL` and `WITNESS_JOIN_TOKEN` to drive transitions.
 
-2. **Render the join overlay** (`config.yaml.d/01-clusterconfig.yaml`):
-   ```yaml
-   server: "https://<JoinServerIP>:6443"
-   token:  "<cluster-token>"
-   ```
-   This is already implemented by `render_witness_cluster_config` in
-   `witness-utils.sh` — it activates when `WITNESS_JOIN_URL` is set.
+**Stage A — at container start:**
 
-3. **Tear down Phase 1 standalone state** before join:
-   - `kill "$(cat /run/witness/k3s.pid)"`
-   - `rm -rf /var/lib/rancher/k3s/server/db` (etcd)
-   - `rm -rf /var/lib/rancher/k3s/server/tls` (old cluster CA)
-   - `rm -rf /var/lib/rancher/k3s/server/cred`
-   - `rm -rf /var/lib/rancher/k3s/server/manifests`
-   - `rm -rf /var/lib/rancher/k3s/agent`           (no-op under --disable-agent, defensive)
-   - `rm -f /etc/rancher/k3s/k3s.yaml`             (stale kubeconfig)
+1. **Source `/persist/witness-override.env`** via `lib/config.sh`.
+   Sets `WITNESS_NODE_IP`, `WITNESS_NODE_PREFIX`, `WITNESS_IFACE`,
+   `WITNESS_GATEWAY`, `WITNESS_JOIN_URL`, `WITNESS_JOIN_TOKEN`.
 
-   Once-only marker: leave `/persist/vault/witness/.joined` after
-   first successful join. The supervisor loop checks for it; if absent
-   and `WITNESS_JOIN_URL` is set, run the teardown then restart.
+2. **`setup_prereqs`** — mount /var/lib bind to /persist/vault/witness,
+   cgroup setup, modules, wait for default route.
 
-4. **Restart k3s in join mode.** `start_k3s_once` already drops
-   `--cluster-init` when `is_witness_joining` returns true (function
-   already exists). The k3s supervisor loop in Stage B then launches
-   `k3s server --server=... --token=... --disable-agent --node-name=eve-witness`.
+3. **`witness_check_mode_transition`** — compares current desired mode
+   (computed from env vars: `standalone` if no JOIN_URL, else
+   `joined:<URL>`) against the on-disk marker
+   `/var/lib/witness/.cluster-mode`. On mismatch, wipes the persistent
+   k3s server state so the next k3s start does a fresh cluster-init
+   or fresh join.
 
-5. **L3 setup happens before all this.** `setup_witness_netns` in
-   Stage A needs to be enhanced to do macvlan-of-keth0 when
-   `WITNESS_JOIN_URL` is set, instead of the current veth-pair stub.
+4. **`install_k3s`** — downloads / extracts k3s if not already
+   cached. Idempotent across boots.
 
-### 13.5 Critical-config alignment
+5. **`render_witness_network_config`** — writes
+   `config.yaml.d/02-witness-network.yaml` with the current `node-ip`.
+
+6. **`render_witness_cluster_config`** — writes
+   `config.yaml.d/01-clusterconfig.yaml` with server+token if
+   `WITNESS_JOIN_URL` is set, OR removes the file if not. The presence
+   of this file is what tells `start_k3s_once` to omit `--cluster-init`.
+
+7. **`setup_witness_netns`** — creates the eve-witness netns, veth
+   pair with stable MACs, attaches `wit-host` to `WITNESS_IFACE`
+   bridge (in join mode), disables bridge-netfilter sysctls (in join
+   mode — see §13.2), fires gratuitous ARP. **Network configuration
+   is one-time at Stage A and is NOT re-evaluated during runtime
+   transitions.**
+
+8. **Re-exec into eve-witness netns** via `nsenter --net=...`.
+
+**Stage B — supervisor loop (every ~15s):**
+
+```
+loop:
+  re-source $WITNESS_OVERRIDE_FILE          (with sh -n syntax check)
+  if WITNESS_JOIN_URL changed since last iteration:
+      handle transition (see §13.5)
+  if !check_start_containerd: sleep 5; continue
+  start_k3s_once                            (idempotent)
+  log rotation
+  sleep 15
+```
+
+**Critical: no container exit.** EVE's linuxkit does NOT auto-respawn
+dead service containers. All transitions happen in place within Stage
+B; the container survives across cluster-membership changes.
+
+`start_k3s_once` reads `is_witness_joining` (true iff `WITNESS_JOIN_URL`
+is set AND `01-clusterconfig.yaml` exists). When true, launches
+`k3s server --node-name eve-witness --disable-agent` (no `--cluster-init`);
+otherwise launches with `--cluster-init` (standalone).
+
+### 13.5 Dynamic join/leave (IMPLEMENTED)
+
+The witness's role can change at runtime: pillar may decide it's needed
+for quorum now, then not needed later when a 3rd physical node joins,
+then needed again if a node fails. The supervisor loop in Stage B
+re-reads `/persist/witness-override.env` every iteration and reacts to
+state changes in `WITNESS_JOIN_URL`.
+
+**Pillar's responsibility, NOT the witness's:** deciding *when* to set
+or clear `WITNESS_JOIN_URL`. The witness just reacts. A reasonable
+pillar policy:
+
+| Physical cluster Nodes | Pillar action | Witness state |
+|---|---|---|
+| 2 (HA degraded — need 3rd vote) | Set `WITNESS_JOIN_URL` to seed apiserver | joined as 3rd etcd member |
+| 3+ (HA satisfied) | Clear `WITNESS_JOIN_URL` | standalone single-node etcd |
+| 1 (single-node, no HA yet) | Clear `WITNESS_JOIN_URL` | standalone single-node etcd |
+
+Where pillar gets the cluster Node count is its problem — most likely
+the same EdgeNodeClusterStatus / k3s apiserver visibility it already
+uses for the tie-breaker decision.
+
+**Three transitions the witness handles:**
+
+**1. Joined → Standalone** (`WITNESS_JOIN_URL` set → unset):
+
+`witness_leave_cluster()` in `witness-utils.sh` does a graceful 6-step
+leave:
+
+```
+1. witness_get_local_member_id          — query local etcd for own ID
+2. etcdctl member remove                — best-effort, two attempts:
+                                            a. original join URL (port 6443→2379), 5s timeout
+                                            b. any non-self peer from local member list, 5s timeout
+                                          if both fail: warn, proceed anyway
+3. kill -TERM $WITNESS_K3S_PID_FILE     — 30s grace, then SIGKILL
+4. rm -rf /var/lib/rancher/k3s/server/* — wipe cluster state
+5. echo standalone > $WITNESS_MODE_FILE — update marker
+6. render_witness_cluster_config        — removes stale 01-clusterconfig.yaml
+                                          (called from the supervisor loop right after)
+```
+
+Next supervisor iteration sees `WITNESS_K3S_PID_FILE` missing and
+`01-clusterconfig.yaml` absent, so `start_k3s_once` launches k3s with
+`--cluster-init` — standalone single-node behavior.
+
+**Best-effort semantics on the etcd remove:** if neither endpoint
+succeeds within 5s, we log the witness member ID and proceed with the
+local stop + wipe. The cluster will then have an orphan etcd member
+that an operator can clean up via `etcdctl member remove <id>` on a
+healthy cluster node. This avoids the witness getting stuck if the
+cluster has gone unreachable.
+
+**2. Standalone → Joined** (`WITNESS_JOIN_URL` unset → set):
+
+```
+1. SIGTERM the current standalone k3s, 30s grace, SIGKILL fallback
+2. witness_check_mode_transition  — wipes standalone state, updates marker
+3. render_witness_cluster_config  — writes new 01-clusterconfig.yaml with server+token
+                                    (next start_k3s_once will see is_witness_joining=true)
+```
+
+Next supervisor iteration restarts k3s as a joining server.
+
+**3. Joined → Joined (different cluster)** (`WITNESS_JOIN_URL` changed):
+
+Treated as leave-then-join: `witness_leave_cluster` against the OLD
+URL, then `witness_check_mode_transition` + `render_witness_cluster_config`
+for the NEW URL. Total transition time ~30-60s.
+
+**Defensive details:**
+
+- Syntax-check the override file (`sh -n`) before sourcing it.
+  Half-written files from a concurrent pillar update don't cause
+  spurious leaves — previous values are preserved when parse fails.
+- All cluster-state writes go through existing helpers
+  (`witness_check_mode_transition`, `render_witness_cluster_config`).
+- The 15s poll interval bounds reaction latency. Could be reduced
+  but adds CPU; could be replaced with `inotifywait` for instant
+  reaction. Current design favors simplicity.
+
+**Network configuration is NOT re-evaluated on transitions.** Pillar
+changing `WITNESS_IFACE`, `WITNESS_GATEWAY`, `WITNESS_NODE_IP`,
+`WITNESS_NODE_PREFIX` during runtime does not take effect; the witness
+needs an explicit container restart (or device reboot) to apply
+network-topology changes. This is conscious — those values are device
+topology, not mode flags, and they don't change in production.
+
+### 13.6 Critical-config alignment
 
 K3s servers in the same cluster must agree on cluster-wide config.
 The witness's `config.yaml` already aligns:
@@ -1349,7 +1494,7 @@ config, diff against witness's effective config. Mismatches will cause
 the witness to refuse to start with `"critical configuration value
 mismatch"`.
 
-### 13.6 Tie-breaker interaction (open)
+### 13.7 Tie-breaker interaction (open)
 
 `pkg/kube/tie-breaker-utils.sh:Tie_breaker_configApply` cordons +
 drains whichever Node's UUID equals `EdgeNodeClusterStatus.TieBreakerNodeID.UUID`.
@@ -1367,7 +1512,7 @@ nodes) is automatically resolved by the witness not being a Node. The
 tie-breaker mechanism can be retired in a follow-up cleanup, but
 doesn't actively interfere with the witness Phase 2 path.
 
-### 13.7 Manual test sequence (no code changes needed)
+### 13.8 Manual test sequence
 
 This is the dry-run that validates Phase 2 mechanics on a live
 device, modulo whatever L3 design is chosen. The full version is in
@@ -1417,34 +1562,67 @@ chat history; abridged here:
    # 3 members — seed, other, eve-witness@192.168.1.55
    ```
 
-### 13.8 Open questions
+### 13.9 Open questions
 
-- **macvlan-of-keth0 driver support.** Untested on EVE hardware. If
-  some NIC drivers don't support it, fall back to Option B + pillar
-  coordination.
-- **DHCP vs static for the witness IP.** Easiest: static, from
-  EdgeNodeClusterStatus. DHCP would require the cloud-coordinated
-  MAC address (linuxkit doesn't pin macvlan MACs by default).
-- **`Witness.Parent` interface name discovery.** Hardcoding `keth0`
-  works for the lab device but EVE deployments vary. Pillar should
-  publish the right name in ENC.
+- **Pillar bridge-nf-call coordination.** §13.2 implementation disables
+  `bridge-nf-call-iptables` globally on the device when the witness
+  joins. This affects ALL bridges, not just the cluster bridge. If
+  pillar relies on bridge-netfilter for app-traffic isolation policy on
+  other bridges, that policy is also disabled. Long-term: pillar should
+  either (a) add explicit ACCEPT rules for `wit-host` in its FORWARD
+  chain so the per-bridge setting on eth0 alone can stay 0, or (b)
+  publish a "witness mode" flag that toggles bridge-nf-call more
+  surgically. Currently no contract between witness and pillar on this.
+- **Pillar reconciliation of foreign bridge ports.** Pillar/zedrouter
+  manages eth0 the bridge. Adding `wit-host` as a foreign port has been
+  tested and pillar tolerates it across the test session. Whether
+  pillar will reconcile it away on long-running edge cases (DPC
+  reapply, network reconfig, etc.) is uncertain. If we see post-boot
+  evictions in production, we'd need a watchdog or a pillar
+  coordination mechanism (e.g., a `WitnessPort` ENC field that
+  zedrouter respects).
+- **`WITNESS_IFACE` discovery.** Pillar should publish the cluster
+  bridge name in EdgeNodeClusterStatus. Defaulting to `eth0` works for
+  current EVE topologies but isn't universal.
+- **MTU.** veth has 1500 MTU by default. If the cluster uses jumbo
+  frames or VXLAN-encapsulated traffic that exceeds 1500, etcd peer
+  messages will fragment or get dropped. Need to derive MTU from the
+  cluster bridge's MTU at setup time.
 - **Recovery from a dying seed.** §6.4 noted the cluster-reset flow.
-  Now with `--disable-agent`: when the seed dies, the other physical
-  node runs `k3s server --cluster-reset` → new cluster, new CA, new
-  tokens. The witness's existing data is now invalid. It needs to
-  observe "ENC ClusterID changed" → wipe + rejoin against the new
-  seed. This is the same `monitor_cluster_config_change` poller §6.4
-  flagged, just with `--disable-agent` semantics.
-- **MTU.** veth (Phase 1.5 standalone) has 1500 MTU by default.
-  macvlan-of-keth0 inherits keth0's MTU. If the cluster uses jumbo
-  frames or VXLAN-encapsulated traffic, the witness needs matched
-  MTU or etcd peer messages get fragmented and raft suffers.
+  Now with `--disable-agent` + dynamic join/leave: when the seed dies,
+  the other physical node runs `k3s server --cluster-reset` → new
+  cluster, new CA, new tokens. The witness's existing data is now
+  invalid. Pillar should clear `WITNESS_JOIN_URL` then re-set it with
+  the new cluster's URL/token; the witness's runtime transition logic
+  (§13.5) handles the leave+rejoin automatically. The "ENC ClusterID
+  changed" detection lives in pillar, not in the witness.
+- **Election bias for slow disk.** With witness as 3rd etcd member,
+  any leader-loss event runs a fresh election among all 3 members.
+  Witness's disk is slow (`/persist/vault` IO is the bottleneck), so
+  if it wins an election the cluster slows down catastrophically (we
+  observed this in testing — manual `move-leader` recovered). The
+  proposed fix is `election-timeout=10000` in witness's config.yaml
+  (10× longer than peers' default 1000ms) so witness always loses
+  elections. See task #32, not yet baked into image.
+- **Disable apiserver/scheduler/controller-manager on witness.** The
+  witness is etcd-only by design — apiserver/scheduler/controller-manager
+  add load (k8s leader-election lease renewals) without functional
+  benefit. Setting `disable-apiserver: true`, `disable-scheduler: true`,
+  `disable-controller-manager: true` in `config.yaml` would reduce
+  noise and disk pressure. Tested manually via overlay; not yet baked.
+  See task #33.
 
-### 13.9 Out of scope for Phase 2
+### 13.10 Out of scope for Phase 2
 
 - Making the witness a Kubernetes Node again. The whole point of
   `--disable-agent` is to NOT be one.
 - Live migration of the witness between physical hosts. The witness
   is bound to whichever seed device has its persistent vault data.
-- Pillar/zedkube changes required to publish `Witness.*` in ENC. That's
-  a separate component change tracked elsewhere.
+- Pillar/zedkube changes required to publish `Witness.*` in ENC
+  AND to drive the dynamic join/leave signal (set/clear
+  `WITNESS_JOIN_URL` based on cluster node count). That's a separate
+  pillar/zedkube component change tracked elsewhere.
+- Stopping the witness's k3s entirely when not needed. Currently
+  "standalone" means a single-node etcd cluster always running; an
+  even-more-minimal "off" state where k3s is fully stopped would save
+  CPU/disk but adds complexity. Not implemented.
