@@ -74,6 +74,8 @@ COPY cgconfig.conf /etc
 COPY utils.sh /usr/bin/
 COPY pubsub.sh /usr/bin/
 COPY tie-breaker-utils.sh /usr/bin/
+COPY witness-cleanup.sh /usr/bin/
+RUN chmod +x /usr/bin/witness-cleanup.sh
 COPY lib/* /usr/bin/
 RUN mkdir -p /etc/k3s-manifests
 COPY manifests/* /etc/k3s-manifests/

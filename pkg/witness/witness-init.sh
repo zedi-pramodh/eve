@@ -249,6 +249,21 @@ logmsg "pkg/witness Stage B (eve-witness netns) starting"
 prev_join_url="${WITNESS_JOIN_URL:-}"
 prev_join_token="${WITNESS_JOIN_TOKEN:-}"
 
+# Helper: re-run setup_witness_netns from the host network namespace.
+# Stage B runs inside eve-witness netns; setup_witness_netns requires
+# host netns to attach wit-host to the cluster bridge and to write the
+# bridge-netfilter sysctls. We use /proc/1/ns/net (the host's net ns —
+# pid 1 stays in host netns regardless of our re-exec) as the entry
+# point. The witness container runs with `pid: host` (see build.yml),
+# so /proc/1 is the host's init from our perspective.
+witness_resetup_netns_from_host() {
+    nsenter --net=/proc/1/ns/net -- sh -c '
+        . /usr/bin/witness-config.sh
+        . /usr/bin/witness-utils.sh
+        setup_witness_netns
+    '
+}
+
 while true; do
     # Re-read the override file each iteration. Preserve previous
     # values if the file has a syntax error so we don't trigger a
@@ -274,10 +289,20 @@ while true; do
             # Joined ($prev_join_url) -> Standalone
             logmsg "supervisor: WITNESS_JOIN_URL unset (was '$prev_join_url'), leaving cluster"
             witness_leave_cluster
-            # Clear the rendered 01-clusterconfig.yaml so the next k3s
-            # start does NOT see a stale join overlay. With no JOIN_URL
-            # set, render_witness_cluster_config removes it.
+            # Re-render BOTH config fragments with current env vars:
+            # - 02-witness-network.yaml: node-ip (may have changed if
+            #   override file's WITNESS_NODE_IP differs from the
+            #   value that was rendered at Stage A boot).
+            # - 01-clusterconfig.yaml: removed (no JOIN_URL set, so
+            #   render_witness_cluster_config clears it).
+            render_witness_network_config
             render_witness_cluster_config
+            # Re-setup network in standalone mode (detach wit-host from
+            # bridge — bridge attachment isn't needed for standalone
+            # operation and leaving it isn't harmful, but tearing it
+            # down keeps the netns state matching the marker).
+            witness_resetup_netns_from_host || \
+                logmsg "supervisor: WARN — re-setup of netns for standalone mode failed"
         elif [ -n "$cur_join_url" ] && [ -z "$prev_join_url" ]; then
             # Standalone -> Joined ($cur_join_url)
             logmsg "supervisor: WITNESS_JOIN_URL set to '$cur_join_url', joining cluster"
@@ -296,17 +321,59 @@ while true; do
                 fi
                 rm -f "$WITNESS_K3S_PID_FILE"
             fi
-            # Wipe standalone state + update marker.
+            # NOTE: stale eve-witness-* cleanup in the target cluster's
+            # etcd is now handled by pkg/kube (see
+            # /usr/bin/witness-cleanup.sh in the kube container). pkg/kube
+            # always has cluster certs since it IS a cluster member;
+            # invoking this script before promoting/repromoting a witness
+            # avoids the chicken-and-egg problem the witness side faced.
+            # Operator / pillar must run that script on the seed (or any
+            # healthy cluster member) BEFORE setting WITNESS_JOIN_URL
+            # here. If they don't, k3s join may fail with peer-URL
+            # conflict, which is recoverable via manual etcdctl on the
+            # seed — but the right path is to run the cleanup script.
             witness_check_mode_transition
-            # Write the join overlay config (01-clusterconfig.yaml).
+            # Re-render BOTH config fragments with current env vars:
+            # - 02-witness-network.yaml: node-ip from override (was
+            #   defaulted at Stage A boot to standalone IP, now needs
+            #   the join-mode IP from WITNESS_NODE_IP override).
+            # - 01-clusterconfig.yaml: join server + token.
+            # Without re-rendering 02-witness-network.yaml, k3s would
+            # read stale node-ip from Stage A boot, etcd would try to
+            # bind to the old IP, and join would fail with "cannot
+            # assign requested address".
+            render_witness_network_config
             render_witness_cluster_config
+            # CRITICAL: re-setup the netns NOW in join mode. setup_witness_netns
+            # at Stage A only saw "standalone" (because WITNESS_JOIN_URL was
+            # unset at boot); now that we're flipping to join mode, we need
+            # wit-host attached to the cluster bridge AND bridge-nf-call
+            # sysctls disabled, BOTH of which only happen in the function's
+            # join branch. Without this, the new k3s server cannot reach
+            # the seed apiserver (frames don't egress the bridge) and join
+            # fails with "no route to host".
+            if ! witness_resetup_netns_from_host; then
+                logmsg "supervisor: ERROR — re-setup of netns for join mode failed; k3s join will not work"
+            fi
         else
             # Joined ($prev_join_url) -> Joined ($cur_join_url) — different cluster.
             logmsg "supervisor: WITNESS_JOIN_URL changed from '$prev_join_url' to '$cur_join_url', migrating"
             witness_leave_cluster
-            # witness_leave_cluster set marker to standalone; now flip to new cluster.
+            # NOTE: stale eve-witness-* cleanup on the NEW cluster is
+            # pkg/kube's responsibility (see /usr/bin/witness-cleanup.sh
+            # in the kube container). Pillar/operator should invoke it
+            # on the new cluster's seed before setting WITNESS_JOIN_URL.
             witness_check_mode_transition
+            # Re-render network + cluster configs with possibly-updated
+            # WITNESS_NODE_IP / WITNESS_NODE_PREFIX / WITNESS_GATEWAY
+            # (pillar may have changed any of those alongside the URL).
+            render_witness_network_config
             render_witness_cluster_config
+            # Re-setup netns — though we were already in join mode, the
+            # gateway / IP may have changed if pillar updated other
+            # override fields. setup_witness_netns is idempotent.
+            witness_resetup_netns_from_host || \
+                logmsg "supervisor: WARN — re-setup of netns for new cluster failed"
         fi
         prev_join_url="$cur_join_url"
     fi

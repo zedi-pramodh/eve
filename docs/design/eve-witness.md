@@ -1465,6 +1465,61 @@ for the NEW URL. Total transition time ~30-60s.
   but adds CPU; could be replaced with `inotifywait` for instant
   reaction. Current design favors simplicity.
 
+**Stale-member cleanup on join — handled by pkg/kube, not the witness.**
+
+When a node hosting the witness dies and pillar promotes another node
+to host the witness, the dead host's `eve-witness-*` etcd entry lingers
+in the cluster's member list. Left there, it can collide with the new
+witness's `MemberAdd` (same peer URL if `WITNESS_NODE_IP` is unchanged).
+
+The cleanup belongs in pkg/kube, not in pkg/witness, because:
+
+- pkg/kube is itself a cluster member and **always** has the cluster's
+  etcd TLS certs at `/var/lib/rancher/k3s/server/tls/etcd/`. No
+  chicken-and-egg cert problem.
+- pkg/kube on the seed (or any healthy cluster member) can authoritatively
+  manage cluster membership via its local etcd endpoint.
+- Keeps pkg/witness's join path simple — the witness just joins; it
+  doesn't need to know how to garbage-collect orphans.
+
+**The helper script:** `pkg/kube/witness-cleanup.sh`, installed to
+`/usr/bin/witness-cleanup.sh` inside the kube container.
+
+```
+What it does:
+  1. List etcd members at https://127.0.0.1:2379 using local pkg/kube certs.
+  2. Filter members by name prefix "eve-witness-".
+  3. `etcdctl member remove` each matching ID.
+  4. Print before/after member tables for operator visibility.
+  5. Exit 0 on success (including no-op), 2 if any removal failed.
+
+Usage (manual today; pillar-driven later):
+  # On any healthy cluster node:
+  eve enter kube
+  /usr/bin/witness-cleanup.sh
+
+  # Output shows what was removed:
+  # "Current etcd members BEFORE cleanup: ..."
+  # "Removing stale eve-witness-* members: ..."
+  # "Current etcd members AFTER cleanup: ..."
+```
+
+**Operational protocol (manual today):**
+
+1. Decide witness promotion target (which node will host the witness).
+2. Run `/usr/bin/witness-cleanup.sh` on any healthy cluster member's
+   pkg/kube container.
+3. Write `/persist/witness-override.env` on the target witness device
+   with `WITNESS_JOIN_URL` + token + network params.
+4. Witness's Stage B supervisor loop detects the override file change
+   within ~15s and joins.
+
+**Future automation (pillar/zedkube responsibility):** when pillar
+decides to promote a witness on node X, it should run
+`witness-cleanup.sh` on any healthy cluster member's pkg/kube container
+THEN write the override file on node X. The witness itself doesn't need
+to know — it just reacts to the override file.
+
 **Network configuration is NOT re-evaluated on transitions.** Pillar
 changing `WITNESS_IFACE`, `WITNESS_GATEWAY`, `WITNESS_NODE_IP`,
 `WITNESS_NODE_PREFIX` during runtime does not take effect; the witness
