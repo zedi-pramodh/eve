@@ -41,7 +41,8 @@ COPY 00-nodename.yaml /etc/rancher/k3s/config.yaml.d/00-nodename.yaml
 COPY witness-init.sh /usr/bin/witness-init.sh
 COPY witness-utils.sh /usr/bin/witness-utils.sh
 COPY lib/config.sh /usr/bin/witness-config.sh
-RUN chmod +x /usr/bin/witness-init.sh /usr/bin/witness-utils.sh
+COPY wipe-and-rejoin.sh /usr/bin/wipe-and-rejoin.sh
+RUN chmod +x /usr/bin/witness-init.sh /usr/bin/witness-utils.sh /usr/bin/wipe-and-rejoin.sh
 
 # Witness-private containerd config (kubelet talks to it via
 # /run/witness/containerd/containerd.sock). See containerd-config.toml

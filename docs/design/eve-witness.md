@@ -1651,6 +1651,22 @@ chat history; abridged here:
   the new cluster's URL/token; the witness's runtime transition logic
   (§13.5) handles the leave+rejoin automatically. The "ENC ClusterID
   changed" detection lives in pillar, not in the witness.
+
+  The cluster-reset itself is operator-driven today via
+  `pkg/kube/cluster-reset.sh` (shipped at `/usr/bin/cluster-reset.sh`
+  inside the kube container). It handles k3s's edge cases that
+  bit us in testing: (1) k3s refuses `--cluster-reset` when
+  `server:` is set in config, so the script comments out only that
+  line (not the whole file — node-ip must survive); (2) k3s
+  sometimes constructs the new single-member entry with the LAN IP
+  instead of node-ip, so the script verifies the peer URL post-reset
+  and corrects it via `etcdctl member update`; (3) unstarted
+  learner entries from pre-reset failed joins (e.g. a witness
+  partially added before quorum loss) are removed. The script
+  preserves all data (etcd db, k8s objects, tokens, certs) and
+  snapshots `db` to `db.backup-<ts>` before the reset for rollback.
+  Run inside the kube container on the SURVIVING node ONLY; running
+  on multiple nodes forks the cluster.
 - **Election bias for slow disk.** With witness as 3rd etcd member,
   any leader-loss event runs a fresh election among all 3 members.
   Witness's disk is slow (`/persist/vault` IO is the bottleneck), so

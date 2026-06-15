@@ -76,10 +76,17 @@ COPY pubsub.sh /usr/bin/
 COPY tie-breaker-utils.sh /usr/bin/
 COPY witness-cleanup.sh /usr/bin/
 RUN chmod +x /usr/bin/witness-cleanup.sh
+COPY cluster-reset.sh /usr/bin/
+RUN chmod +x /usr/bin/cluster-reset.sh
+COPY wipe-and-rejoin.sh /usr/bin/
+RUN chmod +x /usr/bin/wipe-and-rejoin.sh
 COPY lib/* /usr/bin/
 RUN mkdir -p /etc/k3s-manifests
 COPY manifests/* /etc/k3s-manifests/
 
+
+# Two node HA
+COPY cluster-reset.sh /usr/bin/
 
 # upgrades
 COPY cluster-update.sh /usr/bin/
