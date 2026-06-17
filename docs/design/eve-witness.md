@@ -1247,10 +1247,9 @@ visible on `wit-host` (entering bridge) but **never** on `keth0`
 (exiting to wire); same in reverse. L2/ARP works fine (different
 codepath).
 
-Setting the per-bridge `/sys/class/net/eth0/bridge/nf_call_iptables=0`
-is NOT sufficient on EVE 6.12 kernels — observed empirically that
-traffic is still filtered when the global setting is 1. Disabling the
-three global sysctls is required:
+**REVISED (task #48): the global-sysctl disable was a serious bug.**
+
+The first implementation of this fix disabled the *global* sysctls:
 
 ```sh
 echo 0 > /proc/sys/net/bridge/bridge-nf-call-iptables
@@ -1258,18 +1257,62 @@ echo 0 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
 echo 0 > /proc/sys/net/bridge/bridge-nf-call-arptables
 ```
 
-`setup_witness_netns` does this on every join-mode setup. **The change
-is host-wide**: it disables bridge-netfilter for ALL bridges on the
-device, including any pillar-managed app-traffic filtering on eth0.
-The witness can't function without it, but if pillar relies on
-bridge-nf for app-isolation security policy, that policy is also
-disabled.
+That works locally for witness traffic but **breaks the entire
+cluster**: bridge-nf-call is host-wide, so with it off the kernel
+also skips iptables for frames crossing cni0/flannel. kube-proxy's
+DNAT rules for Service ClusterIPs live in iptables (the `nat` table's
+PREROUTING/OUTPUT chains, called via bridge-nf-call hooks on bridged
+pod traffic). With the globals at 0:
 
-Long-term Phase 2 production fix requires pillar coordination — one
-of:
+- Pod-to-Service traffic (e.g. cdi-uploadproxy dialing a per-PVC
+  upload Service ClusterIP at `10.43.117.218:443`) is never DNAT'd
+  to a real pod IP. Packets leave with the unroutable Service CIDR
+  destination and time out.
+- Symptom in the field: CDI uploads hang forever — virtctl runs,
+  the upload pod is Ready, uploadproxy authenticates the upload
+  token, then logs `http: proxy error: dial tcp 10.43.x.x:443:
+  connect: connection timed out` on a loop. PVCs are Bound but the
+  qcow2 never lands.
+
+The correct fix is per-bridge, not global. Linux exposes
+`/sys/class/net/<br>/bridge/nf_call_iptables` (and `_ip6tables` /
+`_arptables`) as a per-bridge override. Setting it to 0 on just the
+witness's bridge tells the kernel "skip iptables for frames bridged
+through THIS bridge only", leaving cni0/flannel's nf_call status at
+the global default of 1 — kube-proxy DNAT keeps working everywhere
+else.
+
+Earlier I noted "per-bridge override is INSUFFICIENT on EVE 6.12
+kernels" based on one investigation. That was misdiagnosis: per-bridge
+*does* work on the witness bridge in current testing. The earlier
+observation was likely conflating bridge-filter drops with iptables
+FORWARD-chain drops at the IP-routing layer, which the per-bridge
+attribute doesn't affect.
+
+`setup_witness_netns` now does:
+
+```sh
+# Globals back to 1 (kube-proxy DNAT depends on this)
+for s in bridge-nf-call-{ip,ip6,arp}tables; do
+    echo 1 > /proc/sys/net/bridge/$s
+done
+# Per-bridge override on the witness bridge ONLY
+for a in nf_call_iptables nf_call_ip6tables nf_call_arptables; do
+    echo 0 > /sys/class/net/$WITNESS_IFACE/bridge/$a
+done
+```
+
+The fix is idempotent and restores globals on every invocation, so
+upgrading from a buggy build (which left them at 0) self-heals on the
+next join-mode netns setup.
+
+If field investigation later shows per-bridge is *actually*
+insufficient in some kernel configuration (instead of working as it
+currently appears to), the fallback is pillar coordination — one of:
+
 1. Pillar's iptables FORWARD chain adds explicit ACCEPT rules for
-   `wit-host` (allowing per-bridge bridge-nf-call to stay 0 while
-   keeping global bridge-nf-call=1 for app isolation).
+   `wit-host` (keeps global bridge-nf-call=1 across the device while
+   still letting witness traffic through).
 2. Pillar publishes a "witness mode" flag that toggles bridge-nf-call
    per-bridge appropriately.
 3. Pillar coordinates the eth0 bridge configuration to include
@@ -1643,6 +1686,47 @@ chat history; abridged here:
   frames or VXLAN-encapsulated traffic that exceeds 1500, etcd peer
   messages will fragment or get dropped. Need to derive MTU from the
   cluster bridge's MTU at setup time.
+
+- **wit-host gets detached from bridge mid-run (tasks #49 / #50 —
+  IMPORTANT operational caveat).** Observed in the field: setup runs
+  at boot, wit-host is attached to the cluster bridge with all the
+  right flags, witness joins etcd and traffic flows. About 5-15
+  minutes later, witness loses all peer connectivity. Investigation
+  showed wit-host had been silently detached from the bridge — no
+  `master eth0`, `/sys/class/net/wit-host/brport` directory gone.
+  The witness keeps TXing into the veth (counters increment), but the
+  frames go nowhere because there's no bridge connecting wit-host to
+  the keth0 physical port. Whiskey's unicast replies were still
+  reaching the host for a while (the bridge FDB still had the witness
+  MAC on the now-orphan wit-host entry, kind of), but once the FDB
+  ages out (~5min default) even that stops working — matching the
+  symptom timeline. ARP from the host to the witness IP also fails
+  with `FAILED` because broadcasts can't reach wit-host either.
+
+  Strongly suspected cause: pillar's zedrouter periodically
+  reconciles host networking and removes interfaces it doesn't know
+  about. wit-host is created by pkg/witness, not registered with
+  pillar — so zedrouter sees it as garbage and detaches it. Pillar
+  reconciler runs roughly every minute, which lines up.
+
+  Workaround (task #49 — IMPLEMENTED): the witness supervisor loop
+  calls `ensure_wit_host_attached` on every 15s iteration. The helper
+  is idempotent — silently no-ops when wit-host is correctly attached
+  with flooding flags on, but if it detects drift it re-attaches and
+  forces `broadcast_flood=multicast_flood=unicast_flood=1` on the
+  brport. So at worst the witness is deaf for ~15s after a detach
+  event before self-healing. Logs a loud line every time it has to
+  re-attach so the operator can correlate with pillar reconciler
+  activity in `/persist/log/zedrouter.log`.
+
+  Proper fix (task #50 — NOT YET DONE): coordinate with pillar so
+  zedrouter respects wit-host. Three approaches under consideration:
+  (a) pkg/witness publishes a "claim" pubsub object that pillar honors;
+  (b) tag wit-host with a netlink attribute pillar's reconciler
+  recognizes as "don't touch"; (c) move bridge attachment into
+  pillar's networking model entirely. (a) is least invasive; (c) is
+  cleanest long-term but biggest change. Until (#50) lands, the
+  defensive re-attach is what keeps the witness alive in the field.
 - **Recovery from a dying seed.** §6.4 noted the cluster-reset flow.
   Now with `--disable-agent` + dynamic join/leave: when the seed dies,
   the other physical node runs `k3s server --cluster-reset` → new
@@ -1675,13 +1759,25 @@ chat history; abridged here:
   proposed fix is `election-timeout=10000` in witness's config.yaml
   (10× longer than peers' default 1000ms) so witness always loses
   elections. See task #32, not yet baked into image.
-- **Disable apiserver/scheduler/controller-manager on witness.** The
-  witness is etcd-only by design — apiserver/scheduler/controller-manager
-  add load (k8s leader-election lease renewals) without functional
-  benefit. Setting `disable-apiserver: true`, `disable-scheduler: true`,
-  `disable-controller-manager: true` in `config.yaml` would reduce
-  noise and disk pressure. Tested manually via overlay; not yet baked.
-  See task #33.
+- **Disable apiserver/scheduler/controller-manager on witness
+  (IMPLEMENTED — task #33).** Originally framed as a "reduce load and
+  lease churn" optimization, this turned out to be **required for
+  correctness**, not optional. With apiserver enabled on the witness,
+  the in-cluster `kubernetes` Service has 3 endpoints — kube-proxy
+  round-robins requests across all three, so ~1/3 of every controller
+  call lands on the witness's apiserver. That apiserver runs inside
+  the eve-witness netns which has no CNI / no route to the pod CIDR
+  (10.42.x.x). When it tries to call an admission webhook (e.g.
+  `longhorn-admission-webhook`), the call goes Service ClusterIP ->
+  pod IP, and fails with "no route to host" on the webhook pod.
+  Symptom in field: PVC creates time out, kubevirt CDI imports stall,
+  random ~33% admission failures. `eve pause witness` makes it go
+  away because there's only 2 apiserver endpoints left and both have
+  real pod networking. The fix is `disable-apiserver: true`,
+  `disable-scheduler: true`, `disable-controller-manager: true` in
+  witness's config.yaml — withdraws the witness from the apiserver
+  endpoint pool and stops controller/scheduler from making
+  webhook-dependent calls. Witness is now purely an etcd vote.
 
 ### 13.10 Out of scope for Phase 2
 

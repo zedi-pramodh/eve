@@ -175,6 +175,11 @@ if [ "${WITNESS_IN_NETNS:-no}" != "yes" ]; then
     # the witness reverts to Phase 1.5 standalone cleanly.
     render_witness_cluster_config
 
+    # In Phase 2 (joined) write disable-apiserver/scheduler/controller-manager;
+    # in Phase 1.5 standalone remove the file so the witness keeps its own
+    # apiserver up (needed for runtime-core init when it's the only server).
+    render_witness_disables_config
+
     # Create the netns + veth pair. MUST run in host netns: `ip netns add`
     # binds /proc/<pid>/ns/net into /var/run/netns/ which itself requires
     # being in the host netns. setup_witness_netns is idempotent across
@@ -297,6 +302,10 @@ while true; do
             #   render_witness_cluster_config clears it).
             render_witness_network_config
             render_witness_cluster_config
+            # Removes 03-witness-disables.yaml — in standalone the
+            # witness is the only k3s server and needs its own
+            # apiserver/scheduler/controller-manager to come up.
+            render_witness_disables_config
             # Re-setup network in standalone mode (detach wit-host from
             # bridge — bridge attachment isn't needed for standalone
             # operation and leaving it isn't harmful, but tearing it
@@ -344,6 +353,11 @@ while true; do
             # assign requested address".
             render_witness_network_config
             render_witness_cluster_config
+            # Writes 03-witness-disables.yaml — in join mode the witness
+            # becomes etcd-only; disabling its apiserver/scheduler/
+            # controller-manager prevents it from serving cluster API
+            # requests it can't satisfy (no pod-network access from netns).
+            render_witness_disables_config
             # CRITICAL: re-setup the netns NOW in join mode. setup_witness_netns
             # at Stage A only saw "standalone" (because WITNESS_JOIN_URL was
             # unset at boot); now that we're flipping to join mode, we need
@@ -369,6 +383,10 @@ while true; do
             # (pillar may have changed any of those alongside the URL).
             render_witness_network_config
             render_witness_cluster_config
+            # Still in join mode (just a different cluster), but call
+            # the renderer for symmetry / safety in case the file was
+            # somehow removed.
+            render_witness_disables_config
             # Re-setup netns — though we were already in join mode, the
             # gateway / IP may have changed if pillar updated other
             # override fields. setup_witness_netns is idempotent.
@@ -383,6 +401,14 @@ while true; do
         sleep 5
         continue
     fi
+
+    # Defensive guard: re-attach wit-host to the cluster bridge if
+    # something (suspected: pillar/zedrouter) detached it. No-op in
+    # standalone mode and when already attached + flooding on. Logs
+    # loudly if it had to do anything. See task #49 / #50 in design doc.
+    ensure_wit_host_attached || \
+        logmsg "supervisor: WARN — ensure_wit_host_attached failed; witness peer connectivity will be broken until next iteration"
+
     start_k3s_once
     check_log_file_size "$WITNESS_LOG_FILE"
     check_log_file_size "witness-install.log"

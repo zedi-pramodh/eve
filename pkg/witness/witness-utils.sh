@@ -208,47 +208,66 @@ setup_witness_netns() {
             logmsg "Set WITNESS_IFACE in /persist/witness-override.env to one of the above."
             return 1
         fi
-        # Attach wit-host as a port of the cluster bridge.
-        if ! ip link set "$WITNESS_VETH_HOST" master "$WITNESS_IFACE"; then
+        # Attach wit-host as a port of the cluster bridge, and set the
+        # brport flooding flags. Uses ensure_wit_host_attached so the
+        # exact same code path is reused by the supervisor's periodic
+        # guard (see below).
+        if ! ensure_wit_host_attached; then
             logmsg "ERROR: failed to attach $WITNESS_VETH_HOST to bridge $WITNESS_IFACE"
             return 1
         fi
         ip link set "$WITNESS_VETH_HOST" up
-        logmsg "Attached $WITNESS_VETH_HOST as a port of bridge $WITNESS_IFACE"
 
         # Disable bridge-netfilter so frames forwarded between bridge
         # ports (wit-host <-> keth0) are NOT processed by iptables.
+        # See git log for the original problem statement (pillar's
+        # FORWARD chain doesn't know about wit-host as a legitimate
+        # bridge port, silently drops frames).
         #
-        # EVE pillar leaves /proc/sys/net/bridge/bridge-nf-call-iptables=1
-        # by default because it uses iptables to filter app traffic on
-        # the eth0 bridge. With that ON, frames between wit-host and
-        # keth0 traverse the FORWARD chain, and pillar's chain doesn't
-        # know about wit-host as a legitimate cluster bridge port —
-        # frames get silently dropped (manifests as etcd peers
-        # unreachable from the witness in both directions, with bridge
-        # FDB entries appearing correct and port flags identical to
-        # keth0; debugged this for hours).
+        # IMPORTANT: this MUST be done per-bridge (sysfs attribute on
+        # /sys/class/net/<br>/bridge/nf_call_iptables), NOT via the
+        # global /proc/sys/net/bridge/bridge-nf-call-iptables sysctl.
         #
-        # This is HOST-WIDE — disables bridge-netfilter for ALL bridges
-        # on this device, including any pillar-managed app traffic
-        # filtering on eth0. The witness can't work without it, but
-        # if pillar relies on bridge-nf for security policy across
-        # other interfaces, that policy is also disabled.
+        # Earlier versions of this code disabled the GLOBAL sysctls.
+        # That broke the entire cluster: those sysctls are host-wide,
+        # so disabling them stops the kernel from invoking iptables on
+        # ANY bridged frames — including pod traffic crossing cni0/
+        # flannel. kube-proxy's DNAT rules for Service ClusterIPs live
+        # in iptables, so with the globals off, Service-IP-targeted
+        # traffic (e.g. cdi-uploadproxy dialing a per-PVC upload
+        # service IP) is never DNAT'd to a pod IP — packets exit with
+        # the unroutable Service CIDR destination, time out. Symptom:
+        # CDI uploads hang at 0 bytes, PVCs created but never populated.
         #
-        # Per-bridge override (/sys/class/net/eth0/bridge/nf_call_iptables=0)
-        # is INSUFFICIENT — observed empirically on EVE 6.12 kernels
-        # that traffic is still filtered when the global setting is 1.
+        # The kernel supports per-bridge override of nf_call_iptables
+        # via sysfs (per-port-group attribute set on the bridge
+        # netlink object). Setting it to 0 on the witness bridge ONLY
+        # skips iptables for frames bridged through that specific
+        # bridge, while cni0/flannel's nf_call_iptables stays at the
+        # global default (1) and kube-proxy DNAT keeps working.
         #
-        # Phase 2 production needs pillar coordination: either pillar
-        # adds wit-host to its iptables FORWARD ACCEPT list, OR pillar
-        # publishes a "witness mode" flag that turns off bridge-nf-call
-        # in a more targeted way.
+        # Restore globals to 1 first (in case a previous boot of this
+        # code stomped them to 0), then set per-bridge to 0 on
+        # $WITNESS_IFACE.
         for sysctl in bridge-nf-call-iptables bridge-nf-call-ip6tables bridge-nf-call-arptables; do
             if [ -w "/proc/sys/net/bridge/$sysctl" ]; then
-                echo 0 > "/proc/sys/net/bridge/$sysctl" || true
+                echo 1 > "/proc/sys/net/bridge/$sysctl" || true
             fi
         done
-        logmsg "Disabled bridge-nf-call sysctls (required for wit-host bridge port to forward etcd traffic)"
+        logmsg "Restored global net.bridge.bridge-nf-call-* sysctls to 1 (kube-proxy DNAT depends on this)"
+
+        # Now disable bridge-nf-call ONLY on the witness bridge. sysfs
+        # path is /sys/class/net/<br>/bridge/nf_call_{iptables,ip6tables,arptables}
+        # — present on any Linux bridge device.
+        for attr in nf_call_iptables nf_call_ip6tables nf_call_arptables; do
+            path="/sys/class/net/${WITNESS_IFACE}/bridge/$attr"
+            if [ -w "$path" ]; then
+                echo 0 > "$path" || true
+            else
+                logmsg "WARN: $path not writable — per-bridge nf_call override may not apply"
+            fi
+        done
+        logmsg "Per-bridge nf_call_* disabled on bridge $WITNESS_IFACE only (witness etcd traffic bypasses iptables; cni0/flannel unaffected)"
     else
         # Standalone mode: wit-host UP but unattached (no cluster reach).
         ip link set "$WITNESS_VETH_HOST" up
@@ -601,6 +620,122 @@ EOF
 # Used by start_k3s_once to decide whether to pass --cluster-init.
 is_witness_joining() {
     [ -n "${WITNESS_JOIN_URL:-}" ] && [ -f "$K3S_CLUSTER_CONFIG_FILE" ]
+}
+
+# Ensure $WITNESS_VETH_HOST is attached to bridge $WITNESS_IFACE and has
+# broadcast/multicast/unicast flooding enabled. Idempotent:
+#   - If already attached AND flood flags are set: returns 0 silently.
+#   - If detached OR flooding is off: attaches, sets flags, logs LOUDLY.
+#   - On unrecoverable error (bridge missing, ip link fails): returns 1.
+#
+# WHY THIS EXISTS:
+#   wit-host is attached to the bridge in setup_witness_netns at boot.
+#   We observed empirically that something on the host (suspected:
+#   pillar/zedrouter's network reconciliation removing interfaces it
+#   doesn't recognize) DETACHES wit-host mid-run. The first symptom is
+#   the bridge's FDB aging out the witness MAC (default ~5 min on EVE),
+#   after which unicast replies to the witness no longer reach wit-host,
+#   broadcasts (ARP) don't reach it, and the witness goes deaf.
+#
+#   This is a defensive guard, not a real fix. The proper fix is pillar
+#   coordination (see task #50: make zedrouter respect wit-host). Until
+#   that lands, the witness supervisor calls this on every iteration to
+#   self-heal within ~15s of any detach.
+#
+# WHY flood flags matter:
+#   bcast_flood and mcast_flood on a bridge port control whether the
+#   bridge floods broadcast/multicast frames OUT to that port. Default
+#   is 1 on kernel-default-attached ports, but explicitly setting them
+#   here is defense-in-depth — if pillar re-attaches the port with
+#   flags off, the bridge still won't deliver ARP requests to the
+#   witness. We must override.
+ensure_wit_host_attached() {
+    # Phase 1.5 standalone: no bridge attachment expected. No-op.
+    [ -n "${WITNESS_JOIN_URL:-}" ] || return 0
+
+    # If the port already has master == $WITNESS_IFACE AND brport dir
+    # exists AND all three flood flags are 1, we're done.
+    local current_master
+    current_master=$(ip -o link show "$WITNESS_VETH_HOST" 2>/dev/null | \
+        grep -o 'master [^ ]*' | awk '{print $2}')
+    if [ "$current_master" = "$WITNESS_IFACE" ] && \
+       [ -d "/sys/class/net/$WITNESS_VETH_HOST/brport" ] && \
+       [ "$(cat /sys/class/net/$WITNESS_VETH_HOST/brport/broadcast_flood 2>/dev/null)" = "1" ] && \
+       [ "$(cat /sys/class/net/$WITNESS_VETH_HOST/brport/multicast_flood 2>/dev/null)" = "1" ] && \
+       [ "$(cat /sys/class/net/$WITNESS_VETH_HOST/brport/unicast_flood 2>/dev/null)" = "1" ]; then
+        return 0
+    fi
+
+    # Something's off. Loud log so we can correlate with pillar logs.
+    logmsg "ensure_wit_host_attached: state drift detected (current_master='${current_master:-<none>}', wanted='$WITNESS_IFACE'); reattaching"
+
+    if ! ip link set "$WITNESS_VETH_HOST" master "$WITNESS_IFACE" 2>/dev/null; then
+        logmsg "ensure_wit_host_attached: ERROR — 'ip link set $WITNESS_VETH_HOST master $WITNESS_IFACE' failed"
+        return 1
+    fi
+
+    # Force flood flags on. Kernel default is 1 but pillar may have
+    # cleared them; either way we want them on.
+    for attr in broadcast_flood multicast_flood unicast_flood; do
+        local path="/sys/class/net/$WITNESS_VETH_HOST/brport/$attr"
+        if [ -w "$path" ]; then
+            echo 1 > "$path" 2>/dev/null || \
+                logmsg "ensure_wit_host_attached: WARN — couldn't set $attr=1"
+        fi
+    done
+
+    logmsg "ensure_wit_host_attached: attached $WITNESS_VETH_HOST -> bridge $WITNESS_IFACE; flood flags forced on"
+    return 0
+}
+
+# Render the witness's kube-component disables ONLY in Phase 2 (joined).
+#
+# Why this is conditional on join mode, not always-on:
+#
+# In Phase 1.5 (standalone), the witness IS the only k3s server in its
+# own single-node cluster. Disabling apiserver leaves no apiserver
+# anywhere, and k3s's internal "runtime core" (which wraps the
+# apiserver clientset and drives the etcd-node-list reconciler) can
+# never become ready. Symptom: an endless stream of
+#   "Failed to list nodes with etcd role: runtime core not ready"
+# in witness.log every 15s. Etcd itself runs fine, but the warning is
+# spammy and indicates a partially-initialized control plane.
+#
+# In Phase 2 (joined), the OTHER cluster servers (pkg/kube on the
+# physical nodes) provide apiserver/scheduler/controller-manager. The
+# witness becomes a pure etcd vote, and disabling its own
+# apiserver/scheduler/controller-manager is REQUIRED for correctness:
+# otherwise the witness's apiserver gets registered as a member of
+# the `kubernetes` Service endpoints, kube-proxy round-robins API
+# traffic across all three apiservers, and the ~1/3 of requests that
+# land on the witness fail when the apiserver tries to dial an
+# admission-webhook pod IP — the witness netns has no CNI / no route
+# to the cluster pod CIDR. Field symptom: random PVC creates time out
+# with "no route to host" on longhorn-admission-webhook.
+#
+# So: in join mode write the disables; in standalone remove them. Must
+# be called from the same places as render_witness_cluster_config —
+# Stage A boot, and every supervisor-loop mode transition.
+render_witness_disables_config() {
+    mkdir -p "$K3S_CONFIG_DIR"
+    if [ -z "${WITNESS_JOIN_URL:-}" ]; then
+        if [ -f "$K3S_DISABLES_CONFIG_FILE" ]; then
+            rm -f "$K3S_DISABLES_CONFIG_FILE"
+            logmsg "Removed $K3S_DISABLES_CONFIG_FILE (standalone — witness needs its own apiserver)"
+        fi
+        return 0
+    fi
+    cat > "$K3S_DISABLES_CONFIG_FILE" <<EOF
+---
+# AUTO-GENERATED by witness-utils.sh:render_witness_disables_config.
+# Written only when WITNESS_JOIN_URL is set (Phase 2 join mode). In
+# standalone the witness needs its own apiserver and this file is
+# removed. Do NOT edit by hand.
+disable-apiserver: true
+disable-scheduler: true
+disable-controller-manager: true
+EOF
+    logmsg "Rendered $K3S_DISABLES_CONFIG_FILE (Phase 2 — witness is etcd-only)"
 }
 
 wait_for_vault() {

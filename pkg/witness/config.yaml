@@ -3,13 +3,23 @@
 #
 # Architecture (Phase 1.5+ FINAL — see git history for what was tried):
 #
-# The witness runs k3s in **server-only mode** (--disable-agent) inside
-# its own network namespace (eve-witness). It contributes apiserver,
-# controller-manager, scheduler, and — critically — etcd to the cluster.
-# It does NOT run kubelet, kube-proxy, or flannel. The witness has no
-# Kubernetes Node object, doesn't appear in `kubectl get nodes`, and
-# never hosts workloads. Its sole purpose is to be the 3rd etcd vote
-# for HA quorum in a 2-physical-node EVE-k cluster.
+# The witness runs k3s in **etcd-only mode** inside its own network
+# namespace (eve-witness). It contributes ONLY etcd to the cluster —
+# apiserver, scheduler, controller-manager, and the agent (kubelet,
+# kube-proxy, flannel) are all explicitly disabled below. The witness
+# has no Kubernetes Node object, doesn't appear in `kubectl get nodes`,
+# never serves API requests, and never hosts workloads. Its sole
+# purpose is to be the 3rd etcd vote for HA quorum in a
+# 2-physical-node EVE-k cluster.
+#
+# Why etcd-only? The witness lives inside the eve-witness netns and
+# has no CNI / no route into the cluster pod CIDR. Anything that needs
+# to dial a pod IP from this k3s process (admission webhooks,
+# controller-manager reconciles, scheduler API roundtrips that
+# transitively hit webhooks) will fail with "no route to host". The
+# only k3s component with no such dependency is etcd — it peers with
+# its siblings over the bridged 10.244.240.0/24 cluster network, which
+# IS reachable from inside the netns.
 #
 # Why server-only mode?
 #
@@ -60,6 +70,23 @@ write-kubeconfig-mode: "0644"
 # THE pivot — see the long comment above.
 disable-agent: true
 
+# NOTE: disable-apiserver / disable-scheduler / disable-controller-manager
+# are NOT set here. They're rendered conditionally into
+# config.yaml.d/03-witness-disables.yaml ONLY when the witness is in
+# Phase 2 join mode (WITNESS_JOIN_URL set). See
+# witness-utils.sh:render_witness_disables_config and the long
+# explanation there.
+#
+# Short version of why: in Phase 1.5 standalone the witness IS the
+# only k3s server in its (single-node) cluster — disabling apiserver
+# leaves no apiserver at all and k3s's internal runtime-core init
+# never completes, spamming "Failed to list nodes with etcd role:
+# runtime core not ready". In Phase 2 join, the other cluster
+# apiservers cover, and disabling the witness's apiserver is REQUIRED
+# for correctness (otherwise it ends up in the kubernetes-Service
+# endpoint pool and serves ~1/3 of API requests, including webhook
+# calls it can't complete because it has no pod-network access).
+
 # node-ip is rendered into config.yaml.d/02-witness-network.yaml on every
 # container start by witness-init.sh, from $WITNESS_NODE_IP in
 # lib/config.sh — overridable via /persist/witness-override.env without
@@ -103,6 +130,12 @@ etcd-expose-metrics: true
 # cpu-manager-reconcile-period, reserved-cpus). Likewise node-taint is
 # gone (no Node to taint), as is container-runtime-endpoint /
 # default-local-storage-path (no kubelet means no pod runtime, no PVs).
+#
+# NOTE: with disable-apiserver/controller-manager set above, these
+# kube-*-arg values are no-ops on the witness. Kept here only to keep
+# the witness's surface config aligned with pkg/kube's for any future
+# critical-config comparison check by k3s — easier to leave aligned
+# than to drift and have to defend the divergence later.
 kube-controller-arg:
   - "node-monitor-period=10s"
   - "node-monitor-grace-period=40s"
