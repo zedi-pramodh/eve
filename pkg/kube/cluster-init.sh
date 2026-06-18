@@ -345,6 +345,53 @@ check_start_k3s() {
   return 0
 }
 
+# ensure_witness_iptables_rules installs iptables ACCEPT rules at the TOP
+# of INPUT and FORWARD chains for traffic to/from the witness IP. Required
+# in cluster mode so the witness's etcd traffic can transit this host
+# (either inbound to local etcd at $cluster_node_ip:2380, or transit
+# across the eth0 bridge to another peer) without being dropped by
+# pillar's DENY-L3-FORWARD rule in FORWARD-device.
+#
+# Per-bridge nf_call_iptables=0 on the eth0 bridge SHOULD bypass iptables
+# for bridged frames, but empirically on EVE 6.12 kernels it doesn't —
+# iptables FORWARD runs anyway, and pillar's drop fires. Field symptom:
+# witness can establish etcd peer to one node (conntrack carries the
+# initial connection through) but can't reach others; cluster degrades
+# to "witness joins as learner, never promoted, log spam about
+# unhealthy peer probes".
+#
+# Idempotent: -C tests each rule before -I inserts. Re-runs cheaply on
+# every main-loop iteration so pillar's reconciler stripping the rules
+# is self-healed within ~15s.
+#
+# WITNESS_IP: hard-coded to 10.244.240.5 (the documented EVE witness IP,
+# matches pkg/witness's default WITNESS_NODE_IP). If you ever change
+# the witness's IP, this constant has to track. Long-term we should
+# read it from EdgeNodeClusterStatus published by pillar, once pillar
+# starts publishing it (see task #50).
+WITNESS_IP="10.244.240.5"
+ensure_witness_iptables_rules() {
+    [ -f /var/lib/edge-node-cluster-mode ] || return 0
+    local installed=0
+    for chain in INPUT FORWARD; do
+        for spec in "-s $WITNESS_IP" "-d $WITNESS_IP"; do
+            # shellcheck disable=SC2086
+            if ! iptables -C "$chain" $spec -j ACCEPT 2>/dev/null; then
+                # shellcheck disable=SC2086
+                if iptables -I "$chain" 1 $spec -j ACCEPT 2>/dev/null; then
+                    installed=$((installed + 1))
+                else
+                    logmsg "ensure_witness_iptables_rules: WARN — failed to install '$chain $spec -j ACCEPT'"
+                fi
+            fi
+        done
+    done
+    if [ $installed -gt 0 ]; then
+        logmsg "ensure_witness_iptables_rules: installed $installed rule(s) for witness IP $WITNESS_IP in INPUT+FORWARD"
+    fi
+    return 0
+}
+
 # cleanup_stale_masterleases removes etcd masterlease entries whose IP does not
 # match cluster_node_ip.  k3s's HA endpoint reconciler reads every key under
 # /registry/masterleases/ and writes each IP into the kubernetes service
@@ -1640,6 +1687,10 @@ else
                 if [ ! -f /var/lib/node-labels-initialized ]; then
                         reapply_node_labels
                 fi
+                # Keep iptables ACCEPT rules for witness traffic installed.
+                # Idempotent — silent no-op when rules are in place. See
+                # the function's docstring for the full story.
+                ensure_witness_iptables_rules
                 if ! external_boot_image_import; then
                         logmsg "external_boot_image_import failed, will retry on next loop iteration"
                 fi

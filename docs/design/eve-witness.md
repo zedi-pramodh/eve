@@ -1247,7 +1247,64 @@ visible on `wit-host` (entering bridge) but **never** on `keth0`
 (exiting to wire); same in reverse. L2/ARP works fine (different
 codepath).
 
-**REVISED (task #48): the global-sysctl disable was a serious bug.**
+**REVISED AGAIN (task #52): per-bridge override doesn't actually work
+on EVE 6.12 kernel. Real fix is iptables ACCEPT rules.**
+
+After landing task #48 (per-bridge nf_call=0 instead of globals=0), we
+hit a SECOND set of failures. The witness joined etcd, peered with one
+member, but couldn't reach others. Eventually the cluster degraded.
+Counters showed iptables FORWARD was running on bridged frames despite
+per-bridge=0. Investigation:
+
+- `iptables -Z FORWARD; nsenter --net=/run/netns/eve-witness ping ...; iptables -nvL FORWARD`
+  showed 3 packets reaching FORWARD-apps and FORWARD-device → `DENY-L3-FORWARD`.
+- ACCEPT rules with `-i wit-host` had 0 packets — kernel reports bridged
+  frames in iptables with `-i eth0` (the bridge), not `-i wit-host`
+  (the port).
+- ACCEPT rules with `-s WITNESS_IP -j ACCEPT` at the TOP of FORWARD
+  fixed it on the witness-side host.
+- But remote peers (sanjose, vodka) were still dropping witness traffic
+  — they have their own pillar rule sets and need the same fix.
+
+The conclusion: per-bridge nf_call_iptables=0 is unreliable on this
+kernel. We can't depend on it. The robust fix is **explicit iptables
+ACCEPT rules for the witness IP on every cluster host**, installed
+before pillar's drops, kept alive against pillar's reconciler:
+
+```sh
+# Run on EVERY cluster host (whiskey, sanjose, vodka, and any witness host):
+iptables -I INPUT   1 -s 10.244.240.5 -j ACCEPT
+iptables -I INPUT   1 -d 10.244.240.5 -j ACCEPT
+iptables -I FORWARD 1 -s 10.244.240.5 -j ACCEPT
+iptables -I FORWARD 1 -d 10.244.240.5 -j ACCEPT
+```
+
+Both chains matter: FORWARD for traffic transiting through the host's
+bridge to other peers, INPUT for traffic landing on the host's own
+cluster IP (e.g. sanjose's etcd listening on `10.244.240.3:2380`
+receiving an incoming peer connection from the witness).
+
+`pkg/witness/witness-utils.sh:ensure_witness_iptables_rules` and
+`pkg/kube/cluster-init.sh:ensure_witness_iptables_rules` (same name on
+purpose) install these. The witness side runs in the witness-init
+supervisor every 15s; the kube side runs in cluster-init's main loop.
+Both are idempotent (`iptables -C` before `-I`), so pillar stripping
+the rules is self-healed within one tick on either side.
+
+Globals stay at 1, so kube-proxy DNAT still works — CDI uploads and
+all pod-to-Service traffic transit normally; only witness IP gets the
+special ACCEPT path. Per-bridge `nf_call_iptables=0` is still set on
+the witness bridge as belt-and-suspenders for future kernels that
+might honor it, but no longer the load-bearing mechanism.
+
+WITNESS_IP is hard-coded to 10.244.240.5 in both implementations. If a
+deployment ever needs a different witness IP, both have to track. The
+proper fix is for pillar to publish the IP in EdgeNodeClusterStatus
+and both sides to read from there (task #50 — pillar coordination).
+
+----
+
+**Earlier history of this section, preserved for context:**
 
 The first implementation of this fix disabled the *global* sysctls:
 

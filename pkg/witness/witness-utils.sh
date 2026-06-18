@@ -268,6 +268,13 @@ setup_witness_netns() {
             fi
         done
         logmsg "Per-bridge nf_call_* disabled on bridge $WITNESS_IFACE only (witness etcd traffic bypasses iptables; cni0/flannel unaffected)"
+
+        # Install iptables ACCEPT rules for witness traffic. Per-bridge
+        # nf_call=0 doesn't actually bypass iptables on this kernel —
+        # without these rules, pillar's DENY-L3-FORWARD kills witness
+        # traffic on transit through eth0. See ensure_witness_iptables_rules
+        # docstring for the full story.
+        ensure_witness_iptables_rules
     else
         # Standalone mode: wit-host UP but unattached (no cluster reach).
         ip link set "$WITNESS_VETH_HOST" up
@@ -653,11 +660,37 @@ ensure_wit_host_attached() {
     # Phase 1.5 standalone: no bridge attachment expected. No-op.
     [ -n "${WITNESS_JOIN_URL:-}" ] || return 0
 
-    # If the port already has master == $WITNESS_IFACE AND brport dir
-    # exists AND all three flood flags are 1, we're done.
+    # The bridge, wit-host, and brport sysfs all live in the HOST netns.
+    # The supervisor loop calls us from inside the eve-witness netns
+    # (Stage B re-exec'd into it via `exec nsenter --net=...`). From
+    # there, `ip link show wit-host` returns nothing — wit-host doesn't
+    # exist in our current netns. So the entire check + reattach has to
+    # run with nsenter into the host netns. Pattern matches
+    # witness_resetup_netns_from_host (in witness-init.sh).
+    #
+    # We do the check + reattach in one nsenter call to avoid two
+    # round-trips; logging happens via the inherited file descriptor
+    # since /persist/kubelog/* paths are the same in both namespaces.
+    nsenter --net=/proc/1/ns/net -- sh -c '
+        . /usr/bin/witness-config.sh
+        . /usr/bin/witness-utils.sh
+        _ensure_wit_host_attached_in_host_netns
+    '
+}
+
+# Internal helper — assumes already in host netns. Do NOT call directly
+# from supervisor code; use ensure_wit_host_attached() which handles the
+# nsenter dance.
+_ensure_wit_host_attached_in_host_netns() {
+    # Always re-verify iptables ACCEPT rules first. Idempotent — silent
+    # no-op when rules are intact, loud log when they had to be
+    # reinserted (pillar's reconciler may flush them).
+    ensure_witness_iptables_rules
+
     local current_master
     current_master=$(ip -o link show "$WITNESS_VETH_HOST" 2>/dev/null | \
         grep -o 'master [^ ]*' | awk '{print $2}')
+
     if [ "$current_master" = "$WITNESS_IFACE" ] && \
        [ -d "/sys/class/net/$WITNESS_VETH_HOST/brport" ] && \
        [ "$(cat /sys/class/net/$WITNESS_VETH_HOST/brport/broadcast_flood 2>/dev/null)" = "1" ] && \
@@ -666,16 +699,13 @@ ensure_wit_host_attached() {
         return 0
     fi
 
-    # Something's off. Loud log so we can correlate with pillar logs.
     logmsg "ensure_wit_host_attached: state drift detected (current_master='${current_master:-<none>}', wanted='$WITNESS_IFACE'); reattaching"
 
     if ! ip link set "$WITNESS_VETH_HOST" master "$WITNESS_IFACE" 2>/dev/null; then
-        logmsg "ensure_wit_host_attached: ERROR — 'ip link set $WITNESS_VETH_HOST master $WITNESS_IFACE' failed"
+        logmsg "ensure_wit_host_attached: ERROR — 'ip link set $WITNESS_VETH_HOST master $WITNESS_IFACE' failed (host netns)"
         return 1
     fi
 
-    # Force flood flags on. Kernel default is 1 but pillar may have
-    # cleared them; either way we want them on.
     for attr in broadcast_flood multicast_flood unicast_flood; do
         local path="/sys/class/net/$WITNESS_VETH_HOST/brport/$attr"
         if [ -w "$path" ]; then
@@ -685,6 +715,64 @@ ensure_wit_host_attached() {
     done
 
     logmsg "ensure_wit_host_attached: attached $WITNESS_VETH_HOST -> bridge $WITNESS_IFACE; flood flags forced on"
+    return 0
+}
+
+# Install iptables ACCEPT rules for traffic to/from the witness IP at
+# the TOP of INPUT and FORWARD chains. Idempotent — uses -C to test
+# before -I so re-running is safe.
+#
+# WHY THIS EXISTS:
+#   Per-bridge nf_call_iptables=0 SHOULD bypass iptables for frames
+#   bridged through eth0. Empirically on EVE 6.12 kernels it doesn't —
+#   iptables FORWARD runs anyway. With pillar's `DENY-L3-FORWARD`
+#   sitting in the FORWARD-device chain, witness etcd traffic between
+#   members on different physical hosts gets silently dropped.
+#
+#   Symptom: witness can establish etcd peer to one node (the one whose
+#   ACCEPT rule in conntrack was set up while the connection was new)
+#   but can't reach the other node. Cluster is degraded.
+#
+#   Fix: insert ACCEPT rules in iptables BEFORE pillar's drops. Match
+#   on witness IP source AND destination (return traffic too). Insert
+#   in both INPUT (for traffic landing on a peer's bridge IP, e.g.
+#   when sanjose receives a peer connection on 10.244.240.3:2380) and
+#   FORWARD (for transit traffic across the bridge).
+#
+#   Globals stay at 1 (kube-proxy DNAT depends on it). The ACCEPT
+#   rules carve out witness traffic; everything else still goes
+#   through pillar's normal policy.
+#
+# WHERE THIS RUNS:
+#   - On the witness host: setup_witness_netns calls this during
+#     join-mode netns setup. The witness host needs rules for its
+#     own iptables since witness packets transit its FORWARD chain
+#     when bridged to keth0.
+#   - On other cluster hosts: pkg/kube's cluster-init.sh installs
+#     identical rules — see cluster-init.sh:ensure_witness_iptables.
+#     pkg/witness can't reach those hosts to install rules; that's
+#     a coordinated install.
+#
+# CALLER MUST BE IN HOST NETNS. iptables rules live in the host netns
+# and trying to install them from inside the eve-witness netns affects
+# the wrong table.
+ensure_witness_iptables_rules() {
+    local witness_ip="${WITNESS_NODE_IP:-10.244.240.5}"
+    local installed=0
+    for chain in INPUT FORWARD; do
+        for spec in "-s $witness_ip" "-d $witness_ip"; do
+            if ! iptables -C "$chain" $spec -j ACCEPT 2>/dev/null; then
+                if iptables -I "$chain" 1 $spec -j ACCEPT 2>/dev/null; then
+                    installed=$((installed + 1))
+                else
+                    logmsg "ensure_witness_iptables_rules: WARN — failed to install '$chain $spec -j ACCEPT'"
+                fi
+            fi
+        done
+    done
+    if [ $installed -gt 0 ]; then
+        logmsg "ensure_witness_iptables_rules: installed $installed rule(s) for witness IP $witness_ip in INPUT+FORWARD"
+    fi
     return 0
 }
 
